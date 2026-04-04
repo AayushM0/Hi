@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
 
 from lace.core.config import LaceConfig, get_lace_home, load_config
 from lace.memory.markdown import (
@@ -16,18 +15,13 @@ from lace.memory.models import (
     MemoryLifecycle,
     MemoryObject,
     MemorySource,
+    RetrievalResult,
     make_memory,
 )
 
 
-# ── MemoryStore ───────────────────────────────────────────────────────────────
-
 class MemoryStore:
-    """Primary interface for reading and writing memories.
-
-    All operations go through here. The store talks to the vault
-    (markdown files) directly. Vector operations are added in Chunk 3.
-    """
+    """Primary interface for reading and writing memories."""
 
     def __init__(
         self,
@@ -37,6 +31,25 @@ class MemoryStore:
         self.lace_home = lace_home or get_lace_home()
         self.config = config or load_config(self.lace_home)
         self.vault_path = self.config.vault_path(self.lace_home)
+        self.vector_db_path = self.lace_home / "memory" / "vector_db"
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _get_model_name(self) -> str:
+        return self.config.embeddings.model
+
+    def _embed(self, text: str) -> list[float]:
+        """Embed text using the configured model."""
+        from lace.retrieval.embeddings import embed_text
+        return embed_text(text, model_name=self._get_model_name())
+
+    def _upsert_to_vector_store(self, memory: MemoryObject) -> None:
+        """Store memory embedding in ChromaDB. Silent on failure."""
+        try:
+            from lace.retrieval.vector import upsert_memory
+            upsert_memory(memory, self.vector_db_path)
+        except Exception:
+            pass  # Vector store is optional — markdown is source of truth
 
     # ── Write ─────────────────────────────────────────────────────────────────
 
@@ -50,10 +63,7 @@ class MemoryStore:
         confidence: float = 0.8,
         summary: str | None = None,
     ) -> MemoryObject:
-        """Create and persist a new memory.
-
-        Returns the created MemoryObject.
-        """
+        """Create and persist a new memory with embedding."""
         memory = make_memory(
             content=content,
             category=category,
@@ -65,31 +75,48 @@ class MemoryStore:
         if summary:
             memory.summary = summary
 
+        # Generate embedding
+        try:
+            memory.embedding = self._embed(content)
+        except Exception:
+            memory.embedding = None  # Graceful degradation
+
+        # Write markdown file (source of truth)
         save_memory_to_file(memory, self.vault_path)
+
+        # Write to vector store
+        self._upsert_to_vector_store(memory)
+
         return memory
 
     def save(self, memory: MemoryObject) -> Path:
-        """Persist an existing MemoryObject (update its file)."""
-        return save_memory_to_file(memory, self.vault_path)
+        """Persist an existing MemoryObject (update file + vector store)."""
+        path = save_memory_to_file(memory, self.vault_path)
+        if memory.embedding is None:
+            try:
+                memory.embedding = self._embed(memory.content)
+            except Exception:
+                pass
+        self._upsert_to_vector_store(memory)
+        return path
 
     def forget(self, memory_id: str) -> bool:
-        """Archive a memory so it no longer appears in active searches.
-
-        Returns True if the memory was found and archived, False otherwise.
-        Note: never deletes — only archives.
-        """
+        """Archive a memory — removes from search, never deletes file."""
         memory = self.get(memory_id)
         if memory is None:
             return False
 
         memory.archive()
         save_memory_to_file(memory, self.vault_path)
+
+        # Update vector store metadata to reflect archived state
+        self._upsert_to_vector_store(memory)
         return True
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
     def get(self, memory_id: str) -> MemoryObject | None:
-        """Fetch a single memory by ID. Returns None if not found."""
+        """Fetch a single memory by ID."""
         for md_file in self.vault_path.rglob(f"{memory_id}.md"):
             return markdown_to_memory(md_file)
         return None
@@ -102,65 +129,177 @@ class MemoryStore:
         include_archived: bool = False,
         limit: int = 100,
     ) -> list[MemoryObject]:
-        """Return memories with optional filtering.
-
-        By default excludes archived memories.
-        Results are sorted by last_accessed descending (most recent first).
-        """
+        """Return memories with optional filtering."""
         memories = load_all_memories(self.vault_path)
 
-        # Filter archived unless explicitly requested
         if not include_archived:
             memories = [m for m in memories if m.is_active()]
 
-        # Filter by category
         if category is not None:
             cat = MemoryCategory(category) if isinstance(category, str) else category
             memories = [m for m in memories if m.category == cat]
 
-        # Filter by scope
         if scope is not None:
             memories = [m for m in memories if m.project_scope == scope]
 
-        # Filter by lifecycle
         if lifecycle is not None:
             lc = MemoryLifecycle(lifecycle) if isinstance(lifecycle, str) else lifecycle
             memories = [m for m in memories if m.lifecycle == lc]
 
-        # Sort by last_accessed descending
         memories.sort(key=lambda m: m.last_accessed, reverse=True)
-
         return memories[:limit]
 
-    def search_keyword(self, query: str, limit: int = 20) -> list[MemoryObject]:
-        """Basic keyword search across memory content.
+    # ── Search ────────────────────────────────────────────────────────────────
 
-        This is the fallback when vector search is unavailable.
-        Simple case-insensitive substring match.
+    def search(
+        self,
+        query: str,
+        scope: str = "global",
+        max_results: int | None = None,
+        threshold: float | None = None,
+    ) -> list[RetrievalResult]:
+        """Semantic search using vector similarity + multi-signal ranking.
+
+        Falls back to keyword search if vector store is unavailable.
+
+        Args:
+            query: Natural language search query.
+            scope: Scope to search ("global", "project:my-api").
+            max_results: Override default max results.
+            threshold: Override default relevance threshold.
+
+        Returns:
+            List of RetrievalResult sorted by relevance descending.
         """
+        cfg = self.config.retrieval
+        _max = max_results or cfg.max_results
+        _threshold = threshold or cfg.relevance_threshold
+
+        try:
+            return self._vector_search(query, scope, _max, _threshold)
+        except Exception:
+            # Graceful degradation to keyword search
+            keyword_results = self.search_keyword(query, limit=_max)
+            return [
+                RetrievalResult(
+                    memory=m,
+                    relevance_score=0.5,
+                    match_type="keyword",
+                    rank=i + 1,
+                )
+                for i, m in enumerate(keyword_results)
+            ]
+
+    def _vector_search(
+        self,
+        query: str,
+        scope: str,
+        max_results: int,
+        threshold: float,
+    ) -> list[RetrievalResult]:
+        """Internal: perform vector search + ranking."""
+        from lace.retrieval.embeddings import embed_text
+        from lace.retrieval.vector import multi_scope_vector_search
+        from lace.retrieval.ranking import rank_candidates, RankingWeights
+
+        # Determine which scopes to search
+        if scope == "global":
+            scopes = ["global"]
+        else:
+            scopes = [scope, "global"]  # Project first, then global
+
+        # Embed the query
+        query_embedding = embed_text(query, model_name=self._get_model_name())
+
+        # Search vector store
+        raw_results = multi_scope_vector_search(
+            query_embedding=query_embedding,
+            scopes=scopes,
+            vector_db_path=self.vector_db_path,
+            n_results=max_results * 2,  # Over-fetch for ranking to filter
+        )
+
+        if not raw_results:
+            return []
+
+        # Load full MemoryObjects from markdown (vector store has metadata only)
+        candidates: list[tuple[MemoryObject, float]] = []
+        for result in raw_results:
+            memory = self.get(result["id"])
+            if memory is not None and memory.is_active():
+                candidates.append((memory, result["distance"]))
+
+        # Rank and filter
+        weights = RankingWeights(
+            semantic_similarity=self.config.retrieval.weights.semantic_similarity,
+            recency=self.config.retrieval.weights.recency,
+            frequency=self.config.retrieval.weights.frequency,
+            confidence=self.config.retrieval.weights.confidence,
+            scope=self.config.retrieval.weights.scope,
+        )
+
+        return rank_candidates(
+            candidates=candidates,
+            active_scope=scope,
+            weights=weights,
+            threshold=threshold,
+            max_results=max_results,
+        )
+
+    def search_keyword(self, query: str, limit: int = 20) -> list[MemoryObject]:
+        """Fallback keyword search when vector store is unavailable."""
         query_lower = query.lower()
         memories = self.list(include_archived=False, limit=10_000)
 
         matches: list[tuple[MemoryObject, int]] = []
         for memory in memories:
             score = 0
-            text = (memory.content + " " + " ".join(memory.tags) + " " + memory.category.value).lower()
+            text = (
+                memory.content + " " +
+                " ".join(memory.tags) + " " +
+                memory.category.value
+            ).lower()
 
-            # Exact phrase match scores highest
             if query_lower in text:
                 score += 10
-
-            # Individual word matches
             for word in query_lower.split():
-                if word in text:
+                if len(word) > 2 and word in text:
                     score += 1
 
             if score > 0:
                 matches.append((memory, score))
 
-        # Sort by score descending
         matches.sort(key=lambda x: x[1], reverse=True)
         return [m for m, _ in matches[:limit]]
+
+    def reindex_all(self) -> tuple[int, int]:
+        """Re-embed and re-index all memories into the vector store.
+
+        Useful after switching embedding models or if vector store
+        gets out of sync with the markdown vault.
+
+        Returns:
+            (success_count, failure_count)
+        """
+        from lace.retrieval.vector import upsert_memory
+        from lace.retrieval.embeddings import embed_text
+
+        memories = load_all_memories(self.vault_path)
+        success = 0
+        failure = 0
+
+        for memory in memories:
+            try:
+                memory.embedding = embed_text(
+                    memory.content,
+                    model_name=self._get_model_name(),
+                )
+                upsert_memory(memory, self.vector_db_path)
+                success += 1
+            except Exception:
+                failure += 1
+
+        return success, failure
 
     def stats(self) -> dict[str, int | dict]:
         """Return memory statistics."""

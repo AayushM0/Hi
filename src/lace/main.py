@@ -325,35 +325,57 @@ def memory_forget(
 def memory_search(
     query: Annotated[str, typer.Argument(help="Search query.")],
     limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
+    scope: Annotated[str, typer.Option("--scope", "-s")] = "global",
+    show_scores: Annotated[bool, typer.Option("--scores")] = False,
 ) -> None:
-    """Keyword search memories (semantic search available after Chunk 3)."""
+    """Semantic search across memories."""
     store = _get_store()
-    memories = store.search_keyword(query, limit=limit)
 
-    if not memories:
+    with console.status(f"[bold green]Searching for:[/bold green] {query}"):
+        results = store.search(query, scope=scope, max_results=limit)
+
+    if not results:
         console.print(f"[yellow]No memories found for:[/yellow] {query}")
         return
 
     table = Table(
-        title=f"Search: '{query}' ({len(memories)} results)",
+        title=f"Search: '{query}' ({len(results)} results)",
         show_header=True,
         header_style="bold cyan",
         expand=True,
     )
+    table.add_column("Rank", width=4)
     table.add_column("ID", style="dim", width=16)
     table.add_column("Category", width=10)
     table.add_column("Tags", width=20)
+    if show_scores:
+        table.add_column("Score", width=6)
     table.add_column("Summary")
 
-    for memory in memories:
-        table.add_row(
-            memory.id,
-            memory.category.value,
-            ", ".join(memory.tags[:3]) if memory.tags else "[dim]—[/dim]",
-            memory.display_summary(),
-        )
+    for result in results:
+        m = result.memory
+        row = [
+            str(result.rank),
+            m.id,
+            m.category.value,
+            ", ".join(m.tags[:3]) if m.tags else "[dim]—[/dim]",
+        ]
+        if show_scores:
+            row.append(f"{result.relevance_score:.3f}")
+        row.append(m.display_summary())
+        table.add_row(*row)
 
     console.print(table)
+    console.print(f"[dim]Match type: {results[0].match_type if results else '—'}[/dim]")
+
+@memory_app.command("reindex")
+def memory_reindex() -> None:
+    """Re-embed all memories into the vector store."""
+    store = _get_store()
+    with console.status("[bold green]Re-indexing all memories...[/bold green]"):
+        success, failure = store.reindex_all()
+    console.print(f"[green]✓[/green] Indexed {success} memories. Failures: {failure}")
+
 
 
 @memory_app.command("stats")
@@ -378,6 +400,53 @@ def memory_stats() -> None:
             border_style="cyan",
         )
     )
+
+@memory_app.command("search")
+def memory_search(
+    query: Annotated[str, typer.Argument(help="Search query.")],
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
+    scope: Annotated[str, typer.Option("--scope", "-s")] = "global",
+    show_scores: Annotated[bool, typer.Option("--scores")] = False,
+) -> None:
+    """Semantic search across memories."""
+    store = _get_store()
+
+    with console.status(f"[bold green]Searching for:[/bold green] {query}"):
+        results = store.search(query, scope=scope, max_results=limit)
+
+    if not results:
+        console.print(f"[yellow]No memories found for:[/yellow] {query}")
+        return
+
+    table = Table(
+        title=f"Search: '{query}' ({len(results)} results)",
+        show_header=True,
+        header_style="bold cyan",
+        expand=True,
+    )
+    table.add_column("Rank", width=4)
+    table.add_column("ID", style="dim", width=16)
+    table.add_column("Category", width=10)
+    table.add_column("Tags", width=20)
+    if show_scores:
+        table.add_column("Score", width=6)
+    table.add_column("Summary")
+
+    for result in results:
+        m = result.memory
+        row = [
+            str(result.rank),
+            m.id,
+            m.category.value,
+            ", ".join(m.tags[:3]) if m.tags else "[dim]—[/dim]",
+        ]
+        if show_scores:
+            row.append(f"{result.relevance_score:.3f}")
+        row.append(m.display_summary())
+        table.add_row(*row)
+
+    console.print(table)
+    console.print(f"[dim]Match type: {results[0].match_type if results else '—'}[/dim]")
 
 
 # ── project placeholders ──────────────────────────────────────────────────────
