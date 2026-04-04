@@ -1,185 +1,402 @@
-"""Memory CRUD operations — the interface between the CLI/MCP and the vault."""
+"""LACE CLI entry point."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import Annotated, Optional
 
-from lace.core.config import LaceConfig, get_lace_home, load_config
-from lace.memory.markdown import (
-    load_all_memories,
-    markdown_to_memory,
-    save_memory_to_file,
+import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich import print as rprint
+
+from lace.core.config import (
+    get_lace_home,
+    init_lace_home,
+    load_config,
+    set_config_value,
 )
-from lace.memory.models import (
-    MemoryCategory,
-    MemoryLifecycle,
-    MemoryObject,
-    MemorySource,
-    make_memory,
+
+app = typer.Typer(
+    name="lace",
+    help="LACE — Local AI Context Engine",
+    add_completion=False,
+    rich_markup_mode="rich",
 )
 
+config_app = typer.Typer(help="Manage LACE configuration.")
+app.add_typer(config_app, name="config")
 
-# ── MemoryStore ───────────────────────────────────────────────────────────────
+memory_app = typer.Typer(help="Manage memories.")
+app.add_typer(memory_app, name="memory")
 
-class MemoryStore:
-    """Primary interface for reading and writing memories.
+project_app = typer.Typer(help="Manage projects.")
+app.add_typer(project_app, name="project")
 
-    All operations go through here. The store talks to the vault
-    (markdown files) directly. Vector operations are added in Chunk 3.
-    """
+mcp_app = typer.Typer(help="MCP server management.")
+app.add_typer(mcp_app, name="mcp")
 
-    def __init__(
-        self,
-        lace_home: Path | None = None,
-        config: LaceConfig | None = None,
-    ) -> None:
-        self.lace_home = lace_home or get_lace_home()
-        self.config = config or load_config(self.lace_home)
-        self.vault_path = self.config.vault_path(self.lace_home)
+console = Console()
 
-    # ── Write ─────────────────────────────────────────────────────────────────
 
-    def add(
-        self,
-        content: str,
-        category: str | MemoryCategory = MemoryCategory.PATTERN,
-        tags: list[str] | None = None,
-        scope: str = "global",
-        source: str | MemorySource = MemorySource.MANUAL,
-        confidence: float = 0.8,
-        summary: str | None = None,
-    ) -> MemoryObject:
-        """Create and persist a new memory.
+# ── lace init ─────────────────────────────────────────────────────────────────
 
-        Returns the created MemoryObject.
-        """
-        memory = make_memory(
+@app.command()
+def init(
+    home: Annotated[
+        Optional[str],
+        typer.Option("--home", help="Custom LACE home directory."),
+    ] = None,
+) -> None:
+    """Initialize LACE — create ~/.lace directory structure."""
+    lace_home = Path(home).expanduser() if home else get_lace_home()
+
+    with console.status("[bold green]Initializing LACE...[/bold green]"):
+        path, already_existed = init_lace_home(lace_home)
+
+    if already_existed:
+        console.print(
+            Panel(
+                f"[yellow]LACE was already initialized.[/yellow]\n\n"
+                f"Home: [bold]{path}[/bold]\n\n"
+                f"Any missing files/directories have been created.",
+                title="[bold yellow]LACE[/bold yellow]",
+                border_style="yellow",
+            )
+        )
+    else:
+        console.print(
+            Panel(
+                f"[bold green]✓ LACE initialized successfully![/bold green]\n\n"
+                f"Home: [bold]{path}[/bold]\n\n"
+                f"[dim]Next steps:[/dim]\n"
+                f"  1. Edit [bold]{path}/config/identity.md[/bold]\n"
+                f"  2. Edit [bold]{path}/config/preferences.yaml[/bold]\n"
+                f"  3. Run [bold]lace memory add \"your first memory\"[/bold]\n"
+                f"  4. Run [bold]lace mcp start[/bold] — connect to Antigravity",
+                title="[bold green]LACE[/bold green]",
+                border_style="green",
+            )
+        )
+
+
+# ── lace version ──────────────────────────────────────────────────────────────
+
+@app.command()
+def version() -> None:
+    """Show LACE version."""
+    from lace import __version__
+    console.print(f"[bold]LACE[/bold] v{__version__}")
+
+
+# ── config commands ───────────────────────────────────────────────────────────
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show current LACE configuration."""
+    lace_home = get_lace_home()
+    config = load_config(lace_home)
+
+    table = Table(title="LACE Configuration", show_header=True, header_style="bold cyan")
+    table.add_column("Key", style="bold")
+    table.add_column("Value")
+
+    def flatten(d: dict, prefix: str = "") -> list[tuple[str, str]]:
+        rows = []
+        for k, v in d.items():
+            full_key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                rows.extend(flatten(v, full_key))
+            else:
+                rows.append((full_key, str(v)))
+        return rows
+
+    for key, value in flatten(config.model_dump()):
+        table.add_row(key, value)
+
+    console.print(table)
+    console.print(f"\n[dim]Config file: {lace_home}/config/lace.yaml[/dim]")
+
+
+@config_app.command("set")
+def config_set(
+    key: Annotated[str, typer.Argument(help="Config key (e.g. memory.decay_half_life_days)")],
+    value: Annotated[str, typer.Argument(help="New value")],
+) -> None:
+    """Set a configuration value."""
+    try:
+        set_config_value(key, value)
+        console.print(f"[green]✓[/green] Set [bold]{key}[/bold] = [bold]{value}[/bold]")
+    except KeyError as e:
+        console.print(f"[red]✗ Unknown config key:[/red] {e}")
+        raise typer.Exit(1)
+    except ValueError as e:
+        console.print(f"[red]✗ Invalid value:[/red] {e}")
+        raise typer.Exit(1)
+
+
+# ── memory commands ───────────────────────────────────────────────────────────
+
+def _get_store():
+    """Get a MemoryStore instance."""
+    from lace.memory.store import MemoryStore
+    return MemoryStore()
+
+
+@memory_app.command("add")
+def memory_add(
+    content: Annotated[str, typer.Argument(help="The memory content to store.")],
+    tag: Annotated[
+        Optional[list[str]],
+        typer.Option("--tag", "-t", help="Tags (repeatable: --tag=pattern --tag=db)"),
+    ] = None,
+    category: Annotated[
+        str,
+        typer.Option("--category", "-c", help="Category: pattern, decision, debug, reference, preference"),
+    ] = "pattern",
+    scope: Annotated[
+        str,
+        typer.Option("--scope", "-s", help="Scope: global or project:<name>"),
+    ] = "global",
+    summary: Annotated[
+        Optional[str],
+        typer.Option("--summary", help="One-line summary for display."),
+    ] = None,
+) -> None:
+    """Store a new memory."""
+    store = _get_store()
+
+    try:
+        memory = store.add(
             content=content,
             category=category,
-            tags=tags or [],
+            tags=tag or [],
             scope=scope,
-            source=source,
-            confidence=confidence,
+            summary=summary,
         )
-        if summary:
-            memory.summary = summary
+    except ValueError as e:
+        console.print(f"[red]✗ Error:[/red] {e}")
+        raise typer.Exit(1)
 
-        save_memory_to_file(memory, self.vault_path)
-        return memory
+    console.print(
+        Panel(
+            f"[bold green]✓ Memory stored[/bold green]\n\n"
+            f"ID:       [bold]{memory.id}[/bold]\n"
+            f"Category: {memory.category.value}\n"
+            f"Scope:    {memory.project_scope}\n"
+            f"Tags:     {', '.join(memory.tags) if memory.tags else '[dim]none[/dim]'}\n\n"
+            f"[dim]{memory.display_summary()}[/dim]",
+            title="[bold]Memory Added[/bold]",
+            border_style="green",
+        )
+    )
 
-    def save(self, memory: MemoryObject) -> Path:
-        """Persist an existing MemoryObject (update its file)."""
-        return save_memory_to_file(memory, self.vault_path)
 
-    def forget(self, memory_id: str) -> bool:
-        """Archive a memory so it no longer appears in active searches.
+@memory_app.command("list")
+def memory_list(
+    category: Annotated[
+        Optional[str],
+        typer.Option("--category", "-c", help="Filter by category."),
+    ] = None,
+    scope: Annotated[
+        Optional[str],
+        typer.Option("--scope", "-s", help="Filter by scope."),
+    ] = None,
+    include_archived: Annotated[
+        bool,
+        typer.Option("--archived", help="Include archived memories."),
+    ] = False,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-n", help="Max results to show."),
+    ] = 20,
+) -> None:
+    """List stored memories."""
+    store = _get_store()
+    memories = store.list(
+        category=category,
+        scope=scope,
+        include_archived=include_archived,
+        limit=limit,
+    )
 
-        Returns True if the memory was found and archived, False otherwise.
-        Note: never deletes — only archives.
-        """
-        memory = self.get(memory_id)
-        if memory is None:
-            return False
+    if not memories:
+        console.print("[yellow]No memories found.[/yellow]")
+        console.print("[dim]Try: lace memory add \"your first memory\"[/dim]")
+        return
 
-        memory.archive()
-        save_memory_to_file(memory, self.vault_path)
-        return True
+    table = Table(
+        title=f"Memories ({len(memories)} shown)",
+        show_header=True,
+        header_style="bold cyan",
+        expand=True,
+    )
+    table.add_column("ID", style="dim", width=16)
+    table.add_column("Category", width=10)
+    table.add_column("Scope", width=14)
+    table.add_column("Conf", width=5)
+    table.add_column("Tags", width=20)
+    table.add_column("Summary")
 
-    # ── Read ──────────────────────────────────────────────────────────────────
+    for memory in memories:
+        lifecycle_color = {
+            "captured": "white",
+            "validated": "green",
+            "consolidated": "blue",
+            "archived": "red",
+        }.get(memory.lifecycle.value, "white")
 
-    def get(self, memory_id: str) -> MemoryObject | None:
-        """Fetch a single memory by ID. Returns None if not found."""
-        for md_file in self.vault_path.rglob(f"{memory_id}.md"):
-            return markdown_to_memory(md_file)
-        return None
+        table.add_row(
+            memory.id,
+            memory.category.value,
+            memory.project_scope,
+            f"{memory.confidence:.2f}",
+            ", ".join(memory.tags[:3]) if memory.tags else "[dim]—[/dim]",
+            Text(memory.display_summary(), style=lifecycle_color),
+        )
 
-    def list(
-        self,
-        category: str | MemoryCategory | None = None,
-        scope: str | None = None,
-        lifecycle: str | MemoryLifecycle | None = None,
-        include_archived: bool = False,
-        limit: int = 100,
-    ) -> list[MemoryObject]:
-        """Return memories with optional filtering.
+    console.print(table)
 
-        By default excludes archived memories.
-        Results are sorted by last_accessed descending (most recent first).
-        """
-        memories = load_all_memories(self.vault_path)
 
-        # Filter archived unless explicitly requested
-        if not include_archived:
-            memories = [m for m in memories if m.is_active()]
+@memory_app.command("show")
+def memory_show(
+    memory_id: Annotated[str, typer.Argument(help="Memory ID to show.")],
+) -> None:
+    """Show full details of a memory."""
+    store = _get_store()
+    memory = store.get(memory_id)
 
-        # Filter by category
-        if category is not None:
-            cat = MemoryCategory(category) if isinstance(category, str) else category
-            memories = [m for m in memories if m.category == cat]
+    if memory is None:
+        console.print(f"[red]✗ Memory not found:[/red] {memory_id}")
+        raise typer.Exit(1)
 
-        # Filter by scope
-        if scope is not None:
-            memories = [m for m in memories if m.project_scope == scope]
+    console.print(
+        Panel(
+            f"[bold]{memory.display_summary()}[/bold]\n\n"
+            f"{memory.content}\n\n"
+            f"[dim]─────────────────────────────────[/dim]\n"
+            f"ID:           [bold]{memory.id}[/bold]\n"
+            f"Category:     {memory.category.value}\n"
+            f"Source:       {memory.source.value}\n"
+            f"Lifecycle:    {memory.lifecycle.value}\n"
+            f"Confidence:   {memory.confidence:.2f}\n"
+            f"Scope:        {memory.project_scope}\n"
+            f"Tags:         {', '.join(memory.tags) if memory.tags else '[dim]none[/dim]'}\n"
+            f"Access count: {memory.access_count}\n"
+            f"Created:      {memory.created_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
+            f"Last access:  {memory.last_accessed.strftime('%Y-%m-%d %H:%M UTC')}\n"
+            f"File:         [dim]{memory.file_path}[/dim]",
+            title=f"[bold]Memory — {memory.id}[/bold]",
+            border_style="cyan",
+        )
+    )
 
-        # Filter by lifecycle
-        if lifecycle is not None:
-            lc = MemoryLifecycle(lifecycle) if isinstance(lifecycle, str) else lifecycle
-            memories = [m for m in memories if m.lifecycle == lc]
 
-        # Sort by last_accessed descending
-        memories.sort(key=lambda m: m.last_accessed, reverse=True)
+@memory_app.command("forget")
+def memory_forget(
+    memory_id: Annotated[str, typer.Argument(help="Memory ID to archive.")],
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Skip confirmation."),
+    ] = False,
+) -> None:
+    """Archive a memory (removes from search, never deletes)."""
+    store = _get_store()
 
-        return memories[:limit]
+    memory = store.get(memory_id)
+    if memory is None:
+        console.print(f"[red]✗ Memory not found:[/red] {memory_id}")
+        raise typer.Exit(1)
 
-    def search_keyword(self, query: str, limit: int = 20) -> list[MemoryObject]:
-        """Basic keyword search across memory content.
+    if not yes:
+        console.print(f"Archive memory: [bold]{memory.display_summary()}[/bold]")
+        confirmed = typer.confirm("This will remove it from search results. Continue?")
+        if not confirmed:
+            console.print("[dim]Cancelled.[/dim]")
+            return
 
-        This is the fallback when vector search is unavailable.
-        Simple case-insensitive substring match.
-        """
-        query_lower = query.lower()
-        memories = self.list(include_archived=False, limit=10_000)
+    store.forget(memory_id)
+    console.print(f"[green]✓[/green] Memory [bold]{memory_id}[/bold] archived.")
 
-        matches: list[tuple[MemoryObject, int]] = []
-        for memory in memories:
-            score = 0
-            text = (memory.content + " " + " ".join(memory.tags)).lower()
 
-            # Exact phrase match scores highest
-            if query_lower in text:
-                score += 10
+@memory_app.command("search")
+def memory_search(
+    query: Annotated[str, typer.Argument(help="Search query.")],
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
+) -> None:
+    """Keyword search memories (semantic search available after Chunk 3)."""
+    store = _get_store()
+    memories = store.search_keyword(query, limit=limit)
 
-            # Individual word matches
-            for word in query_lower.split():
-                if word in text:
-                    score += 1
+    if not memories:
+        console.print(f"[yellow]No memories found for:[/yellow] {query}")
+        return
 
-            if score > 0:
-                matches.append((memory, score))
+    table = Table(
+        title=f"Search: '{query}' ({len(memories)} results)",
+        show_header=True,
+        header_style="bold cyan",
+        expand=True,
+    )
+    table.add_column("ID", style="dim", width=16)
+    table.add_column("Category", width=10)
+    table.add_column("Tags", width=20)
+    table.add_column("Summary")
 
-        # Sort by score descending
-        matches.sort(key=lambda x: x[1], reverse=True)
-        return [m for m, _ in matches[:limit]]
+    for memory in memories:
+        table.add_row(
+            memory.id,
+            memory.category.value,
+            ", ".join(memory.tags[:3]) if memory.tags else "[dim]—[/dim]",
+            memory.display_summary(),
+        )
 
-    def stats(self) -> dict[str, int | dict]:
-        """Return memory statistics."""
-        all_memories = load_all_memories(self.vault_path)
+    console.print(table)
 
-        by_category: dict[str, int] = {}
-        by_lifecycle: dict[str, int] = {}
-        by_scope: dict[str, int] = {}
 
-        for memory in all_memories:
-            by_category[memory.category.value] = by_category.get(memory.category.value, 0) + 1
-            by_lifecycle[memory.lifecycle.value] = by_lifecycle.get(memory.lifecycle.value, 0) + 1
-            by_scope[memory.project_scope] = by_scope.get(memory.project_scope, 0) + 1
+@memory_app.command("stats")
+def memory_stats() -> None:
+    """Show memory system statistics."""
+    store = _get_store()
+    stats = store.stats()
 
-        return {
-            "total": len(all_memories),
-            "active": sum(1 for m in all_memories if m.is_active()),
-            "archived": sum(1 for m in all_memories if not m.is_active()),
-            "by_category": by_category,
-            "by_lifecycle": by_lifecycle,
-            "by_scope": by_scope,
-        }
+    by_cat = stats["by_category"]
+    by_lc = stats["by_lifecycle"]
+
+    console.print(
+        Panel(
+            f"[bold]Total memories:[/bold] {stats['total']}\n"
+            f"  Active:   {stats['active']}\n"
+            f"  Archived: {stats['archived']}\n\n"
+            f"[bold]By category:[/bold]\n"
+            + "\n".join(f"  {k}: {v}" for k, v in by_cat.items()) +
+            f"\n\n[bold]By lifecycle:[/bold]\n"
+            + "\n".join(f"  {k}: {v}" for k, v in by_lc.items()),
+            title="[bold]Memory Statistics[/bold]",
+            border_style="cyan",
+        )
+    )
+
+
+# ── project placeholders ──────────────────────────────────────────────────────
+
+@project_app.command("list")
+def project_list_placeholder() -> None:
+    """List projects. [dim](Available in Chunk 4)[/dim]"""
+    console.print("[yellow]Project commands available after Chunk 4.[/yellow]")
+
+
+# ── mcp placeholder ───────────────────────────────────────────────────────────
+
+@mcp_app.command("start")
+def mcp_start_placeholder() -> None:
+    """Start the MCP server. [dim](Available in Chunk 5)[/dim]"""
+    console.print("[yellow]MCP server available after Chunk 5.[/yellow]")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    app()

@@ -144,7 +144,7 @@ class MemoryStore:
         matches: list[tuple[MemoryObject, int]] = []
         for memory in memories:
             score = 0
-            text = (memory.content + " " + " ".join(memory.tags)).lower()
+            text = (memory.content + " " + " ".join(memory.tags) + " " + memory.category.value).lower()
 
             # Exact phrase match scores highest
             if query_lower in text:

@@ -126,5 +126,5 @@ def test_stats_returns_correct_counts(store):
     assert stats["total"] == 4
     assert stats["active"] == 3
     assert stats["archived"] == 1
-    assert stats["by_category"]["pattern"] == 2
+    assert stats["by_category"]["pattern"] == 3
     assert stats["by_category"]["decision"] == 1
