@@ -2,15 +2,39 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
+import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich import print as rprint
+
+warnings.filterwarnings("ignore", category=UserWarning, module="sentence_transformers")
+warnings.filterwarnings("ignore", category=UserWarning, module="chromadb")
+warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="transformers")
+
+from lace.core.config import (
+    get_lace_home,
+    init_lace_home,
+    load_config,
+    set_config_value,
+)
+from lace.core.scope import (
+    get_active_scope,
+    detect_current_project,
+    get_projects,
+    create_project,
+    set_project_last_used,
+    get_active_session,
+    create_new_session,
+)
+from lace.core.identity import compose_identity
 
 from lace.core.config import (
     get_lace_home,
@@ -139,10 +163,15 @@ def config_set(
 
 # ── memory commands ───────────────────────────────────────────────────────────
 
-def _get_store():
-    """Get a MemoryStore instance."""
+def _get_store(scope: str | None = None):
+    """Get a MemoryStore instance with active scope."""
     from lace.memory.store import MemoryStore
-    return MemoryStore()
+    store = MemoryStore()
+    # Set active scope for store to use in searches
+    if scope is None:
+        scope = get_active_scope()
+    # We'll add active scope to store in Chunk 5
+    return store
 
 
 @memory_app.command("add")
@@ -325,13 +354,18 @@ def memory_forget(
 def memory_search(
     query: Annotated[str, typer.Argument(help="Search query.")],
     limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
-    scope: Annotated[str, typer.Option("--scope", "-s")] = "global",
+    scope: Annotated[
+        Optional[str],
+        typer.Option("--scope", "-s", help="Scope to search (defaults to active scope)."),
+    ] = None,
     show_scores: Annotated[bool, typer.Option("--scores")] = False,
 ) -> None:
     """Semantic search across memories."""
-    store = _get_store()
+    if scope is None:
+        scope = get_active_scope()
+    store = _get_store(scope=scope)
 
-    with console.status(f"[bold green]Searching for:[/bold green] {query}"):
+    with console.status(f"[bold green]Searching in {scope}:[/bold green] {query}"):
         results = store.search(query, scope=scope, max_results=limit)
 
     if not results:
@@ -339,7 +373,7 @@ def memory_search(
         return
 
     table = Table(
-        title=f"Search: '{query}' ({len(results)} results)",
+        title=f"Search in {scope}: '{query}' ({len(results)} results)",
         show_header=True,
         header_style="bold cyan",
         expand=True,
@@ -367,6 +401,7 @@ def memory_search(
 
     console.print(table)
     console.print(f"[dim]Match type: {results[0].match_type if results else '—'}[/dim]")
+
 
 @memory_app.command("reindex")
 def memory_reindex() -> None:
@@ -449,12 +484,172 @@ def memory_search(
     console.print(f"[dim]Match type: {results[0].match_type if results else '—'}[/dim]")
 
 
-# ── project placeholders ──────────────────────────────────────────────────────
+# Session commands
+
+session_app = typer.Typer(help="Session management.")
+app.add_typer(session_app, name="session")
+
+
+@session_app.command("start")
+def session_start() -> None:
+    """Start a new session (temporary memory scope)."""
+    session_id = create_new_session()
+    console.print(f"[green]✓[/green] Started session: [bold]{session_id}[/bold]")
+
+
+@session_app.command("info")
+def session_info() -> None:
+    """Show current active session."""
+    session = get_active_session()
+    if session:
+        console.print(f"[bold]Active session:[/bold] {session}")
+    else:
+        console.print("[yellow]No active session.[/yellow]")
+
+
+@session_app.command("stop")
+def session_stop() -> None:
+    """Stop current active session."""
+    lace_home = get_lace_home()
+    session_file = lace_home / "sessions" / "active"
+    if session_file.exists():
+        session_file.unlink()
+        console.print("[green]✓[/green] Stopped active session.")
+    else:
+        console.print("[yellow]No active session to stop.[/yellow]")
+
+
+
+# ── project commands ───────────────────────────────────────────────────────────
+
+@project_app.command("create")
+def project_create(
+    name: Annotated[str, typer.Argument(help="Project name.")],
+    description: Annotated[
+        Optional[str],
+        typer.Option("--description", "-d", help="Project description."),
+    ] = None,
+) -> None:
+    """Create a new project."""
+    lace_home = get_lace_home()
+    created = create_project(name, description, lace_home)
+
+    if created:
+        console.print(
+            Panel(
+                f"[bold green]✓ Project created[/bold green]\n\n"
+                f"Name:        [bold]{name}[/bold]\n"
+                f"Scope:       project:{name}\n"
+                f"Description: {description or '[dim]none[/dim]'}\n\n"
+                f"[dim]Add project-specific memories with:[/dim]\n"
+                f"  lace memory add \"...\" --scope=project:{name}",
+                title="[bold]Project Created[/bold]",
+                border_style="green",
+            )
+        )
+    else:
+        console.print(f"[yellow]Project [bold]{name}[/bold] already exists.[/yellow]")
+
 
 @project_app.command("list")
-def project_list_placeholder() -> None:
-    """List projects. [dim](Available in Chunk 4)[/dim]"""
-    console.print("[yellow]Project commands available after Chunk 4.[/yellow]")
+def project_list() -> None:
+    """List all configured projects."""
+    projects = get_projects()
+
+    if not projects:
+        console.print("[yellow]No projects found.[/yellow]")
+        console.print("[dim]Try: lace project create \"my-api\"[/dim]")
+        return
+
+    table = Table(
+        title=f"Projects ({len(projects)} total)",
+        show_header=True,
+        header_style="bold cyan",
+        expand=True,
+    )
+    table.add_column("Name", style="bold")
+    table.add_column("Scope", style="dim")
+    table.add_column("Description", width=40)
+    table.add_column("Last Used", width=20)
+
+    for project in sorted(projects, key=lambda p: p.get("last_used") or "", reverse=True):
+        last_used = project.get("last_used")
+        if last_used:
+            last_used = last_used.split("T")[0]  # Just date, not time
+        else:
+            last_used = "[dim]never[/dim]"
+
+        table.add_row(
+            project["name"],
+            project["scope"],
+            project["description"] or "[dim]none[/dim]",
+            last_used,
+        )
+
+    console.print(table)
+
+
+@project_app.command("switch")
+def project_switch(
+    name: Annotated[str, typer.Argument(help="Project name to switch to.")],
+) -> None:
+    """Switch to a project as active scope."""
+    lace_home = get_lace_home()
+    projects = get_projects()
+    project_names = {p["name"] for p in projects}
+
+    if name not in project_names:
+        console.print(f"[red]✗ Project not found:[/red] {name}")
+        raise typer.Exit(1)
+
+    set_project_last_used(name, lace_home)
+    console.print(f"[green]✓[/green] Switched to project: [bold]{name}[/bold]")
+
+
+@project_app.command("info")
+def project_info() -> None:
+    """Show current active project info."""
+    active_scope = get_active_scope()
+    if active_scope == "global":
+        console.print("[bold]Active scope:[/bold] global")
+        return
+
+    if active_scope.startswith("session:"):
+        session_id = active_scope.removeprefix("session:")
+        console.print(f"[bold]Active scope:[/bold] session:{session_id}")
+        return
+
+    if active_scope.startswith("project:"):
+        project_name = active_scope.removeprefix("project:")
+        lace_home = get_lace_home()
+        projects = get_projects()
+        project = next((p for p in projects if p["name"] == project_name), None)
+
+        if project:
+            console.print(
+                Panel(
+                    f"[bold]Project:[/bold] {project['name']}\n"
+                    f"[bold]Scope:[/bold] {project['scope']}\n"
+                    f"[bold]Description:[/bold] {project['description'] or '[dim]none[/dim]'}\n"
+                    f"[bold]Created:[/bold] {project.get('created_at', '[dim]unknown[/dim]').split('T')[0]}\n"
+                    f"[bold]Last Used:[/bold] {project.get('last_used', '[dim]never[/dim]').split('T')[0]}",
+                    title="[bold]Active Project[/bold]",
+                    border_style="cyan",
+                )
+            )
+        else:
+            console.print(f"[bold]Active scope:[/bold] {active_scope}")
+        return
+
+
+@project_app.command("detect")
+def project_detect() -> None:
+    """Auto-detect current project from working directory."""
+    detected = detect_current_project()
+    if detected:
+        console.print(f"[green]✓ Detected project:[/green] [bold]{detected}[/bold]")
+    else:
+        console.print("[yellow]No project detected in current directory.[/yellow]")
 
 
 # ── mcp placeholder ───────────────────────────────────────────────────────────

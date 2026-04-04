@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from lace.core.config import LaceConfig, get_lace_home, load_config
+from lace.core.scope import get_active_scope
 from lace.memory.markdown import (
     load_all_memories,
     markdown_to_memory,
@@ -27,11 +28,13 @@ class MemoryStore:
         self,
         lace_home: Path | None = None,
         config: LaceConfig | None = None,
+        active_scope: str | None = None,
     ) -> None:
         self.lace_home = lace_home or get_lace_home()
         self.config = config or load_config(self.lace_home)
         self.vault_path = self.config.vault_path(self.lace_home)
         self.vector_db_path = self.lace_home / "memory" / "vector_db"
+        self.active_scope = active_scope or get_active_scope(self.lace_home)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -154,29 +157,18 @@ class MemoryStore:
     def search(
         self,
         query: str,
-        scope: str = "global",
+        scope: str | None = None,
         max_results: int | None = None,
         threshold: float | None = None,
     ) -> list[RetrievalResult]:
-        """Semantic search using vector similarity + multi-signal ranking.
-
-        Falls back to keyword search if vector store is unavailable.
-
-        Args:
-            query: Natural language search query.
-            scope: Scope to search ("global", "project:my-api").
-            max_results: Override default max results.
-            threshold: Override default relevance threshold.
-
-        Returns:
-            List of RetrievalResult sorted by relevance descending.
-        """
+        """Semantic search using vector similarity + multi-signal ranking."""
         cfg = self.config.retrieval
         _max = max_results or cfg.max_results
         _threshold = threshold or cfg.relevance_threshold
-
+        _scope = scope or self.active_scope
+    
         try:
-            return self._vector_search(query, scope, _max, _threshold)
+            return self._vector_search(query, _scope, _max, _threshold)
         except Exception:
             # Graceful degradation to keyword search
             keyword_results = self.search_keyword(query, limit=_max)
