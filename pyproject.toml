@@ -1,0 +1,30 @@
+[project]
+name = "lace"
+version = "0.1.0"
+description = "Local AI Context Engine — persistent memory for every AI tool you already use"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "pyyaml>=6.0.1",
+    "python-frontmatter>=1.1.0",
+]
+
+[project.scripts]
+lace = "lace.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lace"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]

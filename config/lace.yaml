@@ -1,0 +1,33 @@
+version: "1.0"
+
+memory:
+  auto_extract: false
+  extraction_threshold: 0.6
+  require_confirmation: false
+  max_extractions_per_turn: 3
+  dedup_threshold: 0.85
+  decay_half_life_days: 30
+  consolidation_schedule: weekly
+
+retrieval:
+  relevance_threshold: 0.35
+  max_results: 20
+  weights:
+    semantic_similarity: 0.40
+    recency: 0.20
+    frequency: 0.15
+    confidence: 0.15
+    scope: 0.10
+
+vault:
+  obsidian_compatible: true
+  file_watcher: false
+
+logging:
+  retrieval_logs: true
+  interaction_logs: true
+  log_retention_days: 90
+
+embeddings:
+  provider: local
+  model: all-MiniLM-L6-v2

@@ -1,0 +1,19 @@
+coding:
+  language: python
+  version: "3.13"
+  style: functional-preferred
+  testing_framework: pytest
+  type_hints: always
+  docstrings: google-style
+  max_line_length: 88
+
+communication:
+  verbosity: concise
+  code_comments: minimal-but-meaningful
+  explain_reasoning: true
+  show_alternatives: when-relevant
+
+tools:
+  package_manager: uv
+  formatter: ruff
+  linter: ruff
