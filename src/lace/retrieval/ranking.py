@@ -150,30 +150,24 @@ def compute_relevance_score(
 
 
 def rank_candidates(
-    candidates: list[tuple[MemoryObject, float]],  # (memory, distance)
+    candidates: list[tuple[MemoryObject, float]],
     active_scope: str = "global",
     weights: RankingWeights | None = None,
     threshold: float = RELEVANCE_THRESHOLD,
     max_results: int = MAX_RESULTS,
     half_life_days: int = HALF_LIFE_DAYS,
+    min_semantic_score: float = 0.45,   # ← ADD THIS
 ) -> list[RetrievalResult]:
-    """Rank a list of candidate memories and filter by threshold.
-
-    Args:
-        candidates: List of (memory, chromadb_distance) pairs.
-        active_scope: Current project scope for scope scoring.
-        weights: Custom ranking weights.
-        threshold: Minimum relevance score to include in results.
-        max_results: Hard cap on number of results returned.
-        half_life_days: Recency decay rate.
-
-    Returns:
-        List of RetrievalResult sorted by relevance_score descending.
-        Only includes results with score >= threshold.
-    """
+    """Rank candidates and filter by threshold."""
     scored: list[RetrievalResult] = []
 
     for memory, distance in candidates:
+        # HARD GATE: distance > 0.80 means semantically irrelevant
+        # Raw distances: relevant=0.27-0.77, irrelevant=0.91-0.95
+        # This gate runs BEFORE composite scoring
+        if distance > 0.80:
+            continue
+
         score = compute_relevance_score(
             memory=memory,
             distance=distance,
@@ -187,13 +181,10 @@ def rank_candidates(
                 memory=memory,
                 relevance_score=round(score, 4),
                 match_type="vector",
-                rank=0,  # assigned below
+                rank=0,
             ))
 
-    # Sort by relevance descending
     scored.sort(key=lambda r: r.relevance_score, reverse=True)
-
-    # Assign ranks and cap
     results = scored[:max_results]
     for i, result in enumerate(results):
         result.rank = i + 1

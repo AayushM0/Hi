@@ -72,6 +72,30 @@ class EmbeddingsConfig(BaseModel):
     provider: str = "local"              # "local" or "openai"
     model: str = "all-MiniLM-L6-v2"     # local default
 
+class OllamaProviderConfig(BaseModel):
+    host: str = "http://localhost:11434"
+    model: str = "llama3.2"
+    temperature: float = 0.7
+    context_window: int = 8192
+
+
+class OpenAIProviderConfig(BaseModel):
+    model: str = "gpt-4o"
+    temperature: float = 0.7
+    context_window: int = 128000
+
+
+class AnthropicProviderConfig(BaseModel):
+    model: str = "claude-3-5-sonnet-20241022"
+    temperature: float = 0.7
+    context_window: int = 200000
+
+
+class ProviderConfig(BaseModel):
+    default: str = "ollama"
+    ollama: OllamaProviderConfig = Field(default_factory=OllamaProviderConfig)
+    openai: OpenAIProviderConfig = Field(default_factory=OpenAIProviderConfig)
+    anthropic: AnthropicProviderConfig = Field(default_factory=AnthropicProviderConfig)
 
 class LaceConfig(BaseModel):
     """Root configuration model for LACE."""
@@ -81,6 +105,7 @@ class LaceConfig(BaseModel):
     vault: VaultConfig = Field(default_factory=VaultConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
+    provider: ProviderConfig = Field(default_factory=ProviderConfig)  # ← add this
 
     def vault_path(self, lace_home: Path) -> Path:
         """Resolve the vault path."""

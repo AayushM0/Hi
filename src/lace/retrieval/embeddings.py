@@ -28,14 +28,29 @@ _current_model_name: str | None = None
 
 
 def get_model(model_name: str = "all-MiniLM-L6-v2") -> "SentenceTransformer":
-    """Return the embedding model, loading it if necessary.
-
-    Thread-safe singleton — model is loaded once per process.
-    """
+    """Return the embedding model, loading it if necessary."""
     global _model, _current_model_name
 
     with _model_lock:
         if _model is None or _current_model_name != model_name:
+            import os
+            import warnings
+            warnings.filterwarnings("ignore")
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+            # Suppress transformers logging
+            try:
+                import transformers
+                transformers.logging.set_verbosity_error()
+            except Exception:
+                pass
+
+            try:
+                import huggingface_hub
+                huggingface_hub.logging.set_verbosity_error()
+            except Exception:
+                pass
+
             from sentence_transformers import SentenceTransformer
             _model = SentenceTransformer(model_name)
             _current_model_name = model_name

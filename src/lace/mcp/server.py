@@ -8,19 +8,25 @@ Usage:
     lace mcp start --debug # With debug logging
 """
 
+"""LACE MCP Server."""
+
 from __future__ import annotations
 
+import os
 import asyncio
-import logging
-import sys
 import warnings
 
-# Suppress noisy warnings before any imports
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
-import os
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import logging
+import sys
+
+
+
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server

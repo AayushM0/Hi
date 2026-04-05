@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import warnings
+
+# Suppress ALL noisy warnings — must be before any other imports
+warnings.filterwarnings("ignore")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["SENTENCE_TRANSFORMERS_HOME"] = os.path.expanduser("~/.cache/sentence_transformers")
+
 from pathlib import Path
 from typing import Annotated, Optional
+
+
 
 import typer
 import yaml
@@ -14,10 +25,6 @@ from rich.table import Table
 from rich.text import Text
 from rich import print as rprint
 
-warnings.filterwarnings("ignore", category=UserWarning, module="sentence_transformers")
-warnings.filterwarnings("ignore", category=UserWarning, module="chromadb")
-warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
-warnings.filterwarnings("ignore", category=DeprecationWarning, module="transformers")
 
 from lace.core.config import (
     get_lace_home,
@@ -672,6 +679,123 @@ def mcp_start(
 
     from lace.mcp.server import run_server
     asyncio.run(run_server(debug=debug))
+
+
+
+# ── lace ask ──────────────────────────────────────────────────────────────────
+
+@app.command()
+def ask(
+    query: Annotated[str, typer.Argument(help="Your question.")],
+    show_context: Annotated[
+        bool,
+        typer.Option("--show-context", help="Show retrieved memories before response."),
+    ] = False,
+    no_memory: Annotated[
+        bool,
+        typer.Option("--no-memory", help="Skip memory retrieval entirely."),
+    ] = False,
+    scope: Annotated[
+        Optional[str],
+        typer.Option("--scope", "-s", help="Override active scope."),
+    ] = None,
+    max_memories: Annotated[
+        int,
+        typer.Option("--max-memories", "-m", help="Max memories to inject."),
+    ] = 5,
+    provider: Annotated[
+        Optional[str],
+        typer.Option("--provider", "-p", help="Override provider: ollama, openai, anthropic."),
+    ] = None,
+) -> None:
+    """Ask a question with your memory injected automatically."""
+    import time
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    from lace.core.config import load_config, get_lace_home
+    from lace.utils.ask import ask as ask_engine
+
+    lace_home = get_lace_home()
+    config = load_config(lace_home)
+
+    # Override provider if specified
+    if provider:
+        config.provider.default = provider
+
+    start_time = time.time()
+
+    # Run the ask engine
+    try:
+        memories, stream, llm_provider = ask_engine(
+            query=query,
+            use_memory=not no_memory,
+            scope=scope,
+            max_memories=max_memories,
+            lace_home=lace_home,
+            config=config,
+        )
+    except ValueError as e:
+        console.print(f"[red]✗ Configuration error:[/red] {e}")
+        raise typer.Exit(1)
+
+    # Show context panel if requested
+    if show_context:
+        if memories:
+            memory_lines = []
+            for i, result in enumerate(memories, 1):
+                m = result.memory
+                memory_lines.append(
+                    f"  [{i}] [bold]{m.display_summary()[:60]}[/bold]\n"
+                    f"      scope: {m.project_scope} | "
+                    f"conf: {m.confidence:.2f} | "
+                    f"score: {result.relevance_score:.3f}"
+                )
+
+            retrieval_time = int((time.time() - start_time) * 1000)
+            console.print(
+                Panel(
+                    "\n".join(memory_lines) +
+                    f"\n\n[dim]Retrieved {len(memories)} memories in {retrieval_time}ms[/dim]",
+                    title="[bold cyan]Context Retrieved[/bold cyan]",
+                    border_style="cyan",
+                )
+            )
+        else:
+            if no_memory:
+                console.print(Panel(
+                    "[dim]Memory retrieval disabled (--no-memory)[/dim]",
+                    title="[bold cyan]Context[/bold cyan]",
+                    border_style="dim",
+                ))
+            else:
+                console.print(Panel(
+                    "[dim]No relevant memories found for this query.[/dim]",
+                    title="[bold cyan]Context Retrieved[/bold cyan]",
+                    border_style="dim",
+                ))
+
+    # Stream the response
+    console.print()
+    response_chunks: list[str] = []
+
+    try:
+        for chunk in stream:
+            print(chunk, end="", flush=True)
+            response_chunks.append(chunk)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Interrupted.[/dim]")
+        return
+
+    # Footer
+    total_time = int((time.time() - start_time) * 1000)
+    full_response = "".join(response_chunks)
+    token_estimate = len(full_response) // 4
+
+    console.print(f"\n\n[dim]Provider: {llm_provider.provider_name} | "
+                  f"Model: {llm_provider.model_name} | "
+                  f"~{token_estimate} tokens | "
+                  f"{total_time}ms total[/dim]")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
