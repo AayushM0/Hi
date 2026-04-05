@@ -549,6 +549,87 @@ def memory_search(
     console.print(f"[dim]Match type: {results[0].match_type if results else '—'}[/dim]")
 
 
+@memory_app.command("extract")
+def memory_extract(
+    query: Annotated[str, typer.Argument(help="The query from the conversation.")],
+    response: Annotated[str, typer.Argument(help="The response from the conversation.")],
+    scope: Annotated[
+        Optional[str],
+        typer.Option("--scope", "-s", help="Scope to store under."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show what would be extracted without storing."),
+    ] = False,
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Confirm each extraction before storing."),
+    ] = False,
+) -> None:
+    """Extract and store knowledge from a conversation turn."""
+    from lace.memory.extractor import extract_from_conversation, should_attempt_extraction
+    from lace.core.config import load_config
+
+    lace_home  = get_lace_home()
+    config     = load_config(lace_home)
+    store      = _get_store()
+    active_scope = scope or get_active_scope()
+
+    # Pre-filter check
+    if not should_attempt_extraction(query, response):
+        console.print("[yellow]This conversation turn doesn't appear to contain extractable knowledge.[/yellow]")
+        return
+
+    with console.status("[bold green]Extracting knowledge...[/bold green]"):
+        result = extract_from_conversation(
+            query=query,
+            response=response,
+            store=store,
+            scope=active_scope,
+            max_extractions=config.memory.max_extractions_per_turn,
+            require_confirmation=dry_run or confirm,
+        )
+
+    if result.error:
+        console.print(f"[red]✗ Extraction error:[/red] {result.error}")
+        return
+
+    if not result.candidates:
+        console.print("[yellow]No knowledge worth extracting from this turn.[/yellow]")
+        return
+
+    # Show candidates
+    for i, candidate in enumerate(result.candidates, 1):
+        status = ""
+        if dry_run or confirm:
+            status = "[dim](dry run — not stored)[/dim]"
+        elif candidate.content in [
+            store.get(mid).content if store.get(mid) else ""
+            for mid in result.stored
+        ]:
+            status = "[green](stored)[/green]"
+        else:
+            status = "[yellow](skipped — duplicate)[/yellow]"
+
+        console.print(Panel(
+            f"[bold]Content:[/bold] {candidate.content}\n"
+            f"[bold]Category:[/bold] {candidate.category}\n"
+            f"[bold]Tags:[/bold] {', '.join(candidate.tags)}\n"
+            f"[bold]Confidence:[/bold] {candidate.confidence:.2f}\n"
+            f"[bold]Reasoning:[/bold] {candidate.reasoning}\n\n"
+            f"{status}",
+            title=f"[bold]Extraction [{i}][/bold]",
+            border_style="cyan",
+        ))
+
+    # Summary
+    if not dry_run:
+        console.print(
+            f"\n[green]✓[/green] Stored: {len(result.stored)} | "
+            f"Merged: {len(result.merged)} | "
+            f"Skipped (duplicate): {result.skipped}"
+        )
+
 # Session commands
 
 session_app = typer.Typer(help="Session management.")

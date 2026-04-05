@@ -201,11 +201,11 @@ def ask(
             chunks.append(chunk)
             yield chunk
 
-        # Log interaction after stream completes
-        try:
-            total_latency = (time.perf_counter() - stream_start) * 1000
-            response_text = "".join(chunks)
+        response_text  = "".join(chunks)
+        total_latency  = (time.perf_counter() - stream_start) * 1000
 
+        # Log interaction
+        try:
             from lace.utils.logging import RetrievalLogger
             logger = RetrievalLogger(lace_home)
             logger.log_interaction(
@@ -217,7 +217,35 @@ def ask(
                 latency_ms=total_latency,
             )
         except Exception:
-            pass  # Logging never breaks the main flow
+            pass
+
+        # Auto-extraction (if enabled in config)
+        try:
+            if config.memory.auto_extract and use_memory:
+                from lace.memory.extractor import (
+                    extract_from_conversation,
+                    should_attempt_extraction,
+                )
+                if should_attempt_extraction(query, response_text):
+                    store = MemoryStore(lace_home=lace_home, config=config)
+                    result = extract_from_conversation(
+                        query=query,
+                        response=response_text,
+                        store=store,
+                        scope=resolved_scope,
+                        max_extractions=config.memory.max_extractions_per_turn,
+                        require_confirmation=config.memory.require_confirmation,
+                        provider=provider,
+                    )
+                    if result.stored:
+                        # Print to stderr so it doesn't corrupt stdout
+                        import sys
+                        print(
+                            f"\n[LACE] Auto-extracted {len(result.stored)} memories",
+                            file=sys.stderr,
+                        )
+        except Exception:
+            pass  # Extraction never breaks the main flow
 
     return memories, _logged_stream(), provider
 
