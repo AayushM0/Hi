@@ -8,9 +8,12 @@ This is what powers `lace ask`. It:
   5. Streams the response from the configured LLM
 """
 
+
+
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterator
 from typing import Iterator
 
 from lace.core.config import LaceConfig, get_lace_home, load_config
@@ -188,7 +191,35 @@ def ask(
     provider = get_provider(config)
     stream = provider.stream_response(system_prompt, user_message)
 
-    return memories, stream, provider
+    # Wrap stream to log interaction after completion
+    def _logged_stream() -> Iterator[str]:
+        import time
+        chunks: list[str] = []
+        stream_start = time.perf_counter()
+
+        for chunk in stream:
+            chunks.append(chunk)
+            yield chunk
+
+        # Log interaction after stream completes
+        try:
+            total_latency = (time.perf_counter() - stream_start) * 1000
+            response_text = "".join(chunks)
+
+            from lace.utils.logging import RetrievalLogger
+            logger = RetrievalLogger(lace_home)
+            logger.log_interaction(
+                query=query,
+                response_length=len(response_text),
+                provider=provider.provider_name,
+                model=provider.model_name,
+                memories_used=len(memories),
+                latency_ms=total_latency,
+            )
+        except Exception:
+            pass  # Logging never breaks the main flow
+
+    return memories, _logged_stream(), provider
 
 
 def _get_context_window(config: LaceConfig) -> int:

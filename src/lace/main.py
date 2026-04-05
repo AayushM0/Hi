@@ -421,27 +421,85 @@ def memory_reindex() -> None:
 
 
 @memory_app.command("stats")
-def memory_stats() -> None:
-    """Show memory system statistics."""
-    store = _get_store()
-    stats = store.stats()
+def memory_stats(
+    days: Annotated[
+        int,
+        typer.Option("--days", "-d", help="Days of logs to analyze."),
+    ] = 7,
+) -> None:
+    """Show memory statistics and retrieval quality dashboard."""
+    from lace.utils.logging import compute_retrieval_stats, compute_storage_stats
+
+    store    = _get_store()
+    lace_home = get_lace_home()
+
+    stats      = store.stats()
+    retrieval  = compute_retrieval_stats(lace_home / "logs" / "retrieval", days=days)
+    storage    = compute_storage_stats(lace_home)
 
     by_cat = stats["by_category"]
-    by_lc = stats["by_lifecycle"]
+    by_lc  = stats["by_lifecycle"]
 
-    console.print(
-        Panel(
-            f"[bold]Total memories:[/bold] {stats['total']}\n"
-            f"  Active:   {stats['active']}\n"
-            f"  Archived: {stats['archived']}\n\n"
-            f"[bold]By category:[/bold]\n"
-            + "\n".join(f"  {k}: {v}" for k, v in by_cat.items()) +
-            f"\n\n[bold]By lifecycle:[/bold]\n"
-            + "\n".join(f"  {k}: {v}" for k, v in by_lc.items()),
-            title="[bold]Memory Statistics[/bold]",
-            border_style="cyan",
-        )
-    )
+    # ── Memory panel ──────────────────────────────────────────────────────────
+    mem_lines = [
+        f"[bold]Total:[/bold] {stats['total']}  "
+        f"Active: {stats['active']}  Archived: {stats['archived']}",
+        "",
+        "[bold]By category:[/bold]",
+    ]
+    for cat, count in sorted(by_cat.items()):
+        bar = "█" * min(count, 20)
+        mem_lines.append(f"  {cat:<14} {bar} {count}")
+
+    mem_lines += ["", "[bold]By lifecycle:[/bold]"]
+    for lc, count in sorted(by_lc.items()):
+        mem_lines.append(f"  {lc:<16} {count}")
+
+    console.print(Panel(
+        "\n".join(mem_lines),
+        title="[bold cyan]Memory[/bold cyan]",
+        border_style="cyan",
+    ))
+
+    # ── Retrieval quality panel ───────────────────────────────────────────────
+    if retrieval["total_searches"] > 0:
+        ret_lines = [
+            f"[bold]Searches (last {days} days):[/bold] {retrieval['total_searches']}",
+            f"  Avg results/search:  {retrieval['avg_results']}",
+            f"  Zero-result rate:    {retrieval['zero_result_rate']}%",
+            "",
+            "[bold]Latency:[/bold]",
+            f"  Average: {retrieval['avg_latency_ms']}ms",
+            f"  P95:     {retrieval['p95_latency_ms']}ms",
+            "",
+            "[bold]Quality:[/bold]",
+            f"  Avg top-result score: {retrieval['avg_relevance_score']}",
+        ]
+        if retrieval["top_queries"]:
+            ret_lines += ["", "[bold]Top search terms:[/bold]"]
+            for term in retrieval["top_queries"]:
+                ret_lines.append(f"  {term}")
+    else:
+        ret_lines = [
+            f"[dim]No retrieval data for the last {days} days.[/dim]",
+            "[dim]Run some searches to build up stats.[/dim]",
+        ]
+
+    console.print(Panel(
+        "\n".join(ret_lines),
+        title="[bold cyan]Retrieval Quality[/bold cyan]",
+        border_style="cyan",
+    ))
+
+    # ── Storage panel ─────────────────────────────────────────────────────────
+    console.print(Panel(
+        f"[bold]Vault:[/bold]     {storage['vault']}\n"
+        f"[bold]Vector DB:[/bold] {storage['vector_db']}\n"
+        f"[bold]Logs:[/bold]      {storage['logs']}\n"
+        f"[bold]Total:[/bold]     {storage['total']}",
+        title="[bold cyan]Storage[/bold cyan]",
+        border_style="cyan",
+    ))
 
 @memory_app.command("search")
 def memory_search(
@@ -525,6 +583,167 @@ def session_stop() -> None:
     else:
         console.print("[yellow]No active session to stop.[/yellow]")
 
+
+# ── logs commands ─────────────────────────────────────────────────────────────
+
+logs_app = typer.Typer(help="View and manage retrieval logs.")
+app.add_typer(logs_app, name="logs")
+
+
+@logs_app.command("show")
+def logs_show(
+    days: Annotated[
+        int,
+        typer.Option("--days", "-d", help="How many days back to show."),
+    ] = 1,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-n", help="Max entries to show."),
+    ] = 20,
+    log_type: Annotated[
+        str,
+        typer.Option("--type", "-t", help="retrieval or interaction"),
+    ] = "retrieval",
+) -> None:
+    """Show recent retrieval or interaction logs."""
+    from lace.utils.logging import read_recent_logs
+
+    lace_home = get_lace_home()
+    log_dir   = lace_home / "logs" / (
+        "retrieval" if log_type == "retrieval" else "interactions"
+    )
+
+    entries = read_recent_logs(log_dir, days=days, log_type=log_type)[:limit]
+
+    if not entries:
+        console.print(
+            f"[yellow]No {log_type} logs found for the last {days} day(s).[/yellow]"
+        )
+        return
+
+    table = Table(
+        title=f"Recent {log_type} logs ({len(entries)} shown)",
+        show_header=True,
+        header_style="bold cyan",
+        expand=True,
+    )
+
+    if log_type == "retrieval":
+        table.add_column("Time",      width=20)
+        table.add_column("Query",     width=35)
+        table.add_column("Scope",     width=18)
+        table.add_column("Results",   width=7)
+        table.add_column("Latency",   width=10)
+        table.add_column("Top Score", width=9)
+
+        for e in entries:
+            ts      = e.get("timestamp", "")[:19].replace("T", " ")
+            results = e.get("results", [])
+            top     = f"{results[0]['relevance_score']:.3f}" if results else "—"
+            lat     = f"{e.get('latency_ms', 0):.0f}ms"
+
+            table.add_row(
+                ts,
+                e.get("query", "")[:35],
+                e.get("scope", ""),
+                str(e.get("total_results", 0)),
+                lat,
+                top,
+            )
+    else:
+        table.add_column("Time",     width=20)
+        table.add_column("Query",    width=35)
+        table.add_column("Provider", width=10)
+        table.add_column("Memories", width=8)
+        table.add_column("Latency",  width=10)
+
+        for e in entries:
+            ts = e.get("timestamp", "")[:19].replace("T", " ")
+            table.add_row(
+                ts,
+                e.get("query", "")[:35],
+                e.get("provider", ""),
+                str(e.get("memories_used", 0)),
+                f"{e.get('latency_ms', 0):.0f}ms",
+            )
+
+    console.print(table)
+
+
+@logs_app.command("stats")
+def logs_stats(
+    days: Annotated[
+        int,
+        typer.Option("--days", "-d", help="Days to analyze."),
+    ] = 7,
+) -> None:
+    """Show retrieval quality statistics."""
+    from lace.utils.logging import compute_retrieval_stats
+
+    lace_home = get_lace_home()
+    stats     = compute_retrieval_stats(lace_home / "logs" / "retrieval", days=days)
+
+    if stats["total_searches"] == 0:
+        console.print(
+            f"[yellow]No retrieval logs found for the last {days} days.[/yellow]"
+        )
+        return
+
+    lines = [
+        f"[bold]Period:[/bold]         Last {days} days",
+        f"[bold]Total searches:[/bold] {stats['total_searches']}",
+        "",
+        "[bold]Results:[/bold]",
+        f"  Avg per search:   {stats['avg_results']}",
+        f"  Zero-result rate: {stats['zero_result_rate']}%",
+        "",
+        "[bold]Latency:[/bold]",
+        f"  Average: {stats['avg_latency_ms']}ms",
+        f"  P95:     {stats['p95_latency_ms']}ms",
+        "",
+        "[bold]Quality:[/bold]",
+        f"  Avg top score: {stats['avg_relevance_score']}",
+    ]
+
+    if stats["top_queries"]:
+        lines += ["", "[bold]Top search terms:[/bold]"]
+        for t in stats["top_queries"]:
+            lines.append(f"  {t}")
+
+    console.print(Panel(
+        "\n".join(lines),
+        title="[bold cyan]Retrieval Stats[/bold cyan]",
+        border_style="cyan",
+    ))
+
+
+@logs_app.command("clear")
+def logs_clear(
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Skip confirmation."),
+    ] = False,
+    older_than: Annotated[
+        int,
+        typer.Option("--older-than", help="Only clear logs older than N days."),
+    ] = 90,
+) -> None:
+    """Clear old log files."""
+    from lace.utils.logging import clean_old_logs
+
+    lace_home = get_lace_home()
+
+    if not yes:
+        confirmed = typer.confirm(
+            f"Delete log files older than {older_than} days?"
+        )
+        if not confirmed:
+            console.print("[dim]Cancelled.[/dim]")
+            return
+
+    r = clean_old_logs(lace_home / "logs" / "retrieval",    retention_days=older_than)
+    i = clean_old_logs(lace_home / "logs" / "interactions", retention_days=older_than)
+    console.print(f"[green]✓[/green] Deleted {r + i} log files.")
 
 
 # ── project commands ───────────────────────────────────────────────────────────

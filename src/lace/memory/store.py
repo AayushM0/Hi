@@ -30,11 +30,12 @@ class MemoryStore:
         config: LaceConfig | None = None,
         active_scope: str | None = None,
     ) -> None:
-        self.lace_home = lace_home or get_lace_home()
-        self.config = config or load_config(self.lace_home)
-        self.vault_path = self.config.vault_path(self.lace_home)
+        self.lace_home   = lace_home or get_lace_home()
+        self.config      = config or load_config(self.lace_home)
+        self.vault_path  = self.config.vault_path(self.lace_home)
         self.vector_db_path = self.lace_home / "memory" / "vector_db"
-        self.active_scope = active_scope or get_active_scope(self.lace_home)
+        self.active_scope   = active_scope or "global"
+        self._logger        = None   # lazy loaded
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -162,17 +163,21 @@ class MemoryStore:
         threshold: float | None = None,
     ) -> list[RetrievalResult]:
         """Semantic search using vector similarity + multi-signal ranking."""
-        cfg = self.config.retrieval
-        _max = max_results or cfg.max_results
+        import time
+
+        cfg        = self.config.retrieval
+        _max       = max_results or cfg.max_results
         _threshold = threshold or cfg.relevance_threshold
-        _scope = scope or self.active_scope
-    
+        _scope     = scope or self.active_scope
+
+        start = time.perf_counter()
+
         try:
-            return self._vector_search(query, _scope, _max, _threshold)
+            results    = self._vector_search(query, _scope, _max, _threshold)
+            match_type = "vector"
         except Exception:
-            # Graceful degradation to keyword search
             keyword_results = self.search_keyword(query, limit=_max)
-            return [
+            results = [
                 RetrievalResult(
                     memory=m,
                     relevance_score=0.5,
@@ -181,6 +186,30 @@ class MemoryStore:
                 )
                 for i, m in enumerate(keyword_results)
             ]
+            match_type = "keyword"
+
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        # Log every retrieval — silent on failure
+        logger = self._get_logger()
+        if logger:
+            logger.log_retrieval(
+                query=query,
+                scope=_scope,
+                results=results,
+                latency_ms=latency_ms,
+                match_type=match_type,
+            )
+
+        return results
+
+    def _get_logger(self):
+        """Lazy-load the retrieval logger."""
+        if self._logger is None:
+            if self.config.logging.retrieval_logs:
+                from lace.utils.logging import RetrievalLogger
+                self._logger = RetrievalLogger(self.lace_home)
+        return self._logger
 
     def _vector_search(
         self,

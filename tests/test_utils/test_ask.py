@@ -22,7 +22,7 @@ def test_build_system_prompt_no_memories():
         scope="global",
     )
     assert "helpful assistant" in prompt
-    assert "Memory" not in prompt
+    assert "Knowledge Base" not in prompt
 
 
 def test_build_system_prompt_with_memories():
@@ -34,7 +34,7 @@ def test_build_system_prompt_with_memories():
         scope="global",
     )
     assert "asyncpg" in prompt
-    assert "Relevant Context from Memory" in prompt
+    assert "Context from Your Knowledge Base" in prompt
 
 
 def test_build_system_prompt_with_preferences():
