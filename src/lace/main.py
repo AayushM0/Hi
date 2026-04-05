@@ -655,9 +655,23 @@ def project_detect() -> None:
 # ── mcp placeholder ───────────────────────────────────────────────────────────
 
 @mcp_app.command("start")
-def mcp_start_placeholder() -> None:
-    """Start the MCP server. [dim](Available in Chunk 5)[/dim]"""
-    console.print("[yellow]MCP server available after Chunk 5.[/yellow]")
+def mcp_start(
+    debug: Annotated[
+        bool,
+        typer.Option("--debug", help="Enable debug logging."),
+    ] = False,
+) -> None:
+    """Start the LACE MCP server (stdio mode for Antigravity/Cursor)."""
+    import asyncio
+    import warnings
+    import os
+
+    # Suppress all warnings in MCP mode — they corrupt stdio JSON-RPC
+    warnings.filterwarnings("ignore")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    from lace.mcp.server import run_server
+    asyncio.run(run_server(debug=debug))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
