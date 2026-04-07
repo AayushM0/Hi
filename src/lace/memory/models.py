@@ -16,6 +16,7 @@ class MemorySource(str, Enum):
     USER_CORRECTION = "user_correction"
     MANUAL          = "manual"
     INGESTION       = "ingestion"
+    MCP             = "mcp"
 
 
 class MemoryCategory(str, Enum):

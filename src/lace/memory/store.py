@@ -343,3 +343,69 @@ class MemoryStore:
             "by_lifecycle": by_lifecycle,
             "by_scope": by_scope,
         }
+
+    def rate(self, memory_id: str, signal: str) -> bool:
+        """Update memory confidence based on explicit user feedback.
+
+        Args:
+            memory_id: The ID of the memory to rate.
+            signal: "helpful", "outdated", or "wrong".
+
+        Returns:
+            True if memory was found and rated, False otherwise.
+        """
+        from datetime import datetime, timezone
+
+        memory = self.get(memory_id)
+        if memory is None:
+            return False
+
+        now = datetime.now(timezone.utc)
+
+        if signal == "helpful":
+            memory.confidence = min(1.0, memory.confidence + 0.05)
+            memory.access_count += 1
+            memory.last_accessed = now
+            memory.metadata.pop("flagged", None)
+
+        elif signal == "outdated":
+            memory.confidence = max(0.1, memory.confidence * 0.5)
+            memory.metadata["flagged"] = "outdated"
+            memory.last_accessed = now
+
+        elif signal == "wrong":
+            memory.confidence = max(0.05, memory.confidence * 0.2)
+            memory.metadata["flagged"] = "incorrect"
+            memory.last_accessed = now
+
+        else:
+            return False
+
+        self.save(memory)
+        return True
+
+    def get_review_candidates(
+        self,
+        min_confidence: float = 0.7,
+        include_zero_access: bool = True,
+        limit: int = 50,
+    ) -> list[MemoryObject]:
+        """Return memories that need attention for review.
+
+        Criteria:
+        - Confidence < min_confidence
+        - OR never accessed (access_count == 0) and still "captured"
+        - Excludes already archived memories
+        """
+        memories = self.list(include_archived=False, limit=10_000)
+
+        candidates = []
+        for m in memories:
+            if m.confidence < min_confidence:
+                candidates.append(m)
+            elif include_zero_access and m.access_count == 0 and m.lifecycle.value == "captured":
+                candidates.append(m)
+
+        # Sort by confidence ascending (lowest first), then by creation date
+        candidates.sort(key=lambda x: (x.confidence, x.created_at))
+        return candidates[:limit]

@@ -1,24 +1,17 @@
-"""MCP tool definitions for LACE.
-
-These are the functions that Antigravity/Cursor/Claude Desktop
-will call autonomously when they need memory operations.
-
-Each tool has:
-  - A clear docstring (becomes the tool description the LLM sees)
-  - Typed parameters (becomes the tool schema)
-  - A focused return value (JSON-serializable)
-"""
+"""MCP tool implementations — the actual functions exposed to AI agents."""
 
 from __future__ import annotations
-
-import json
-from datetime import datetime, timezone
-from pathlib import Path
+import sys
 
 from lace.core.config import get_lace_home, load_config
-from lace.core.identity import compose_identity
-from lace.core.scope import detect_current_project, get_active_scope
+from lace.core.scope import get_active_scope, get_projects
+from lace.memory.models import MemoryCategory
 from lace.memory.store import MemoryStore
+
+
+def _debug_log(msg: str) -> None:
+    """Debug logging to stderr (MCP uses stdout for JSON-RPC)."""
+    print(f"[LACE DEBUG] {msg}", file=sys.stderr, flush=True)
 
 
 # ── Store factory ─────────────────────────────────────────────────────────────
@@ -37,6 +30,70 @@ def _get_store(scope: str | None = None) -> tuple[MemoryStore, str]:
     return store, resolved_scope
 
 
+def _multi_scope_search(
+    store: MemoryStore,
+    query: str,
+    primary_scope: str,
+    max_results: int,
+) -> list:
+    """Search across multiple scopes intelligently."""
+    all_results = []
+    
+    if primary_scope.startswith("session:"):
+        lace_home = get_lace_home()
+        projects = get_projects(lace_home)
+        
+        for project in projects:
+            project_results = store.search(
+                query=query,
+                scope=project["scope"],
+                max_results=max_results,
+            )
+            all_results.extend(project_results)
+        
+        global_results = store.search(
+            query=query,
+            scope="global",
+            max_results=max_results,
+        )
+        all_results.extend(global_results)
+    
+    elif primary_scope.startswith("project:"):
+        primary_results = store.search(
+            query=query,
+            scope=primary_scope,
+            max_results=max_results,
+        )
+        all_results.extend(primary_results)
+        
+        global_results = store.search(
+            query=query,
+            scope="global",
+            max_results=max_results,
+        )
+        all_results.extend(global_results)
+    
+    else:
+        global_results = store.search(
+            query=query,
+            scope="global",
+            max_results=max_results,
+        )
+        all_results.extend(global_results)
+    
+    # Deduplicate
+    seen = set()
+    unique_results = []
+    for result in all_results:
+        if result.memory.id not in seen:
+            seen.add(result.memory.id)
+            unique_results.append(result)
+    
+    unique_results.sort(key=lambda r: r.relevance_score, reverse=True)
+    
+    return unique_results[:max_results]
+
+
 # ── Tool implementations ──────────────────────────────────────────────────────
 
 async def search_memory(
@@ -44,89 +101,69 @@ async def search_memory(
     scope: str = "auto",
     max_results: int = 5,
     category: str = "all",
+    **kwargs  # Accept any extra args from MCP
 ) -> list[dict]:
-    """Search your knowledge base for memories relevant to a query.
-
-    Use this when the user asks about something they might have
-    encountered, decided, or learned before. Returns memories ranked
-    by relevance with confidence scores.
-
-    Args:
-        query: What to search for (natural language).
-        scope: "auto" uses active project, or specify "global" / "project:<name>".
-        max_results: How many memories to return (default 5, max 20).
-        category: Filter by type — "all", "pattern", "decision", "debug",
-                  "reference", "preference".
-
-    Returns:
-        List of memory objects with relevance scores.
-    """
+    """Search your knowledge base for memories relevant to a query."""
     store, resolved_scope = _get_store(scope)
 
-    results = store.search(
+    results = _multi_scope_search(
+        store=store,
         query=query,
-        scope=resolved_scope,
+        primary_scope=resolved_scope,
         max_results=min(max_results, 20),
     )
 
-    # Filter by category if specified
     if category != "all":
-        results = [r for r in results if r.memory.category.value == category]
+        try:
+            cat = MemoryCategory(category)
+            results = [r for r in results if r.memory.category == cat]
+        except ValueError:
+            pass
 
-    # Serialize to JSON-safe dicts
-    output = []
-    for result in results:
-        m = result.memory
-
-        # Update access tracking
-        m.touch()
-        store.save(m)
-
-        output.append({
-            "id":             m.id,
-            "content":        m.content,
-            "summary":        m.display_summary(),
-            "confidence":     m.confidence,
-            "category":       m.category.value,
-            "source":         m.source.value,
-            "scope":          m.project_scope,
-            "relevance_score": result.relevance_score,
-            "match_type":     result.match_type,
-            "last_accessed":  m.last_accessed.isoformat(),
-            "access_count":   m.access_count,
-            "tags":           m.tags,
-        })
-
-    return output
+    return [
+        {
+            "id": r.memory.id,
+            "content": r.memory.content,
+            "summary": r.memory.display_summary(),
+            "category": r.memory.category.value,
+            "tags": r.memory.tags,
+            "scope": r.memory.project_scope,
+            "confidence": r.memory.confidence,
+            "relevance_score": round(r.relevance_score, 3),
+            "created_at": r.memory.created_at.isoformat(),
+            "access_count": r.memory.access_count,
+        }
+        for r in results
+    ]
 
 
-async def get_project_context() -> dict:
-    """Get the current project's identity, preferences, rules, and conventions.
+async def get_project_context(
+    project_name: str | None = None,
+    **kwargs
+) -> dict:
+    """Get memories and metadata for a specific project."""
+    store, active_scope = _get_store()
 
-    Use this at the start of every conversation to understand:
-    - Who you are and how to behave
-    - The user's coding preferences (language, style, tools)
-    - Project-specific rules and conventions
-    - What the current project is about
+    if project_name:
+        scope = f"project:{project_name}"
+    else:
+        scope = active_scope if active_scope.startswith("project:") else "global"
 
-    Returns:
-        Dict with identity string, preferences, and project metadata.
-    """
-    lace_home = get_lace_home()
-    resolved_scope = get_active_scope(lace_home)
-
-    identity, preferences = compose_identity(lace_home, scope=resolved_scope)
-
-    # Get project name
-    project_name = None
-    if resolved_scope.startswith("project:"):
-        project_name = resolved_scope.removeprefix("project:")
+    memories = store.list(scope=scope, limit=50, include_archived=False)
+    patterns = [m for m in memories if m.category == MemoryCategory.PATTERN][:10]
+    decisions = [m for m in memories if m.category == MemoryCategory.DECISION][:10]
 
     return {
-        "project_name":  project_name,
-        "scope":         resolved_scope,
-        "identity":      identity,
-        "preferences":   preferences,
+        "scope": scope,
+        "total_memories": len(memories),
+        "patterns": [
+            {"id": m.id, "summary": m.display_summary(), "tags": m.tags, "confidence": m.confidence}
+            for m in patterns
+        ],
+        "decisions": [
+            {"id": m.id, "summary": m.display_summary(), "tags": m.tags, "confidence": m.confidence}
+            for m in decisions
+        ],
     }
 
 
@@ -134,133 +171,124 @@ async def remember(
     content: str,
     category: str = "pattern",
     tags: list[str] | None = None,
+    confidence: float = 0.7,
     scope: str = "auto",
+    **kwargs
 ) -> dict:
-    """Store a new piece of knowledge for future retrieval.
-
-    Use this when the user discovers something worth remembering:
-    - A coding pattern or best practice
-    - An architectural decision and its rationale
-    - A debugging insight or root cause
-    - A preference or convention they want to enforce
-
-    Don't store:
-    - Trivial observations
-    - Information already in the knowledge base
-    - Temporary or session-specific context
-
-    Args:
-        content: The knowledge to store (be specific and actionable).
-        category: Type of knowledge — "pattern", "decision", "debug",
-                  "reference", "preference".
-        tags: Optional tags for filtering (e.g. ["fastapi", "performance"]).
-        scope: "auto" uses active project scope.
-
-    Returns:
-        The created memory object with its ID.
-    """
+    """Store a new memory from this interaction."""
     store, resolved_scope = _get_store(scope)
+    
+    # If resolved to a session, default to global instead (sessions are ephemeral)
+    if resolved_scope.startswith("session:"):
+        resolved_scope = "global"
+
+    try:
+        cat = MemoryCategory(category)
+    except ValueError:
+        cat = MemoryCategory.PATTERN
 
     memory = store.add(
         content=content,
-        category=category,
+        category=cat,
         tags=tags or [],
         scope=resolved_scope,
-        source="conversation",
-        confidence=0.8,
+        source="mcp",
+        confidence=max(0.0, min(1.0, confidence)),
     )
 
     return {
-        "id":       memory.id,
-        "content":  memory.content,
-        "summary":  memory.display_summary(),
+        "status": "stored",
+        "id": memory.id,
+        "scope": memory.project_scope,
         "category": memory.category.value,
-        "scope":    memory.project_scope,
-        "tags":     memory.tags,
-        "stored":   True,
     }
 
 
 async def list_memories(
-    category: str = "all",
     scope: str = "auto",
+    category: str = "all",
     limit: int = 20,
-    lifecycle: str = "all",
+    **kwargs  # Accept lifecycle and other args
 ) -> list[dict]:
-    """List stored memories with optional filtering.
-
-    Use when the user wants to browse or review what the system remembers.
-    For searching by content, use search_memory instead.
-
-    Args:
-        category: Filter by type — "all", "pattern", "decision", "debug",
-                  "reference", "preference".
-        scope: "auto" uses active project scope.
-        limit: Maximum number of memories to return.
-        lifecycle: Filter by lifecycle — "all", "captured", "validated",
-                   "consolidated", "archived".
-
-    Returns:
-        List of memory summaries.
-    """
+    """List recent memories, optionally filtered by category or scope."""
     store, resolved_scope = _get_store(scope)
 
-    cat = None if category == "all" else category
-    lc = None if lifecycle == "all" else lifecycle
-    sc = resolved_scope if resolved_scope != "global" else None
+    cat_filter = None
+    if category != "all":
+        try:
+            cat_filter = MemoryCategory(category)
+        except ValueError:
+            pass
 
+    # Handle lifecycle filter (ignore if "all" or invalid)
+    lifecycle_filter = None
+    if "lifecycle" in kwargs and kwargs["lifecycle"] != "all":
+        try:
+            from lace.memory.models import MemoryLifecycle
+            lifecycle_filter = MemoryLifecycle(kwargs["lifecycle"])
+        except (ValueError, KeyError):
+            pass
+    
     memories = store.list(
-        category=cat,
-        scope=sc,
-        lifecycle=lc,
-        include_archived=(lifecycle == "archived"),
+        category=cat_filter,
+        scope=resolved_scope if resolved_scope != "global" else None,
         limit=limit,
+        lifecycle=lifecycle_filter,
+        include_archived=False,
     )
 
     return [
         {
-            "id":           m.id,
-            "summary":      m.display_summary(),
-            "category":     m.category.value,
-            "scope":        m.project_scope,
-            "confidence":   m.confidence,
-            "lifecycle":    m.lifecycle.value,
-            "tags":         m.tags,
-            "access_count": m.access_count,
+            "id": m.id,
+            "summary": m.display_summary(),
+            "category": m.category.value,
+            "tags": m.tags,
+            "scope": m.project_scope,
+            "confidence": m.confidence,
             "last_accessed": m.last_accessed.isoformat(),
         }
         for m in memories
     ]
 
 
-async def forget_memory(memory_id: str) -> dict:
-    """Archive a memory so it no longer appears in search results.
-
-    The memory is NOT deleted — it is archived and can be restored.
-    Use when the user says a memory is outdated, wrong, or no longer relevant.
-
-    Args:
-        memory_id: The ID of the memory to archive (e.g. "mem_abc123").
-
-    Returns:
-        Confirmation with the archived memory's details.
-    """
+async def forget_memory(
+    memory_id: str,
+    **kwargs
+) -> dict:
+    """Archive a memory."""
     store, _ = _get_store()
-
-    memory = store.get(memory_id)
-    if memory is None:
-        return {
-            "success": False,
-            "error":   f"Memory not found: {memory_id}",
-        }
-
-    summary = memory.display_summary()
-    store.forget(memory_id)
+    success = store.forget(memory_id)
 
     return {
-        "success":   True,
-        "id":        memory_id,
-        "summary":   summary,
-        "lifecycle": "archived",
-        "message":   f"Memory archived. It will no longer appear in search results.",
+        "status": "archived" if success else "not_found",
+        "id": memory_id,
     }
+
+
+async def get_related_concepts(
+    concept: str,
+    depth: int = 2,
+    **kwargs  # Accept memories_only and other args
+) -> list[dict]:
+    """Find memories and concepts related to a given concept via the knowledge graph."""
+    from lace.core.engine import GraphManager
+    from lace.graph.traversal import find_memories_near_concept
+
+    lace_home = get_lace_home()
+    manager = GraphManager(lace_home=lace_home)
+    G = manager.get_graph()
+
+    if G.number_of_nodes() == 0:
+        return []
+
+    related = find_memories_near_concept(G, concept, depth=min(depth, 3))
+
+    return [
+        {
+            "type": node["type"],
+            "id": node["id"],
+            "label": node.get("label", ""),
+            "distance": node["distance"],
+        }
+        for node in related[:20]
+    ]

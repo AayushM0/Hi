@@ -8,8 +8,6 @@ Usage:
     lace mcp start --debug # With debug logging
 """
 
-"""LACE MCP Server."""
-
 from __future__ import annotations
 
 import os
@@ -38,6 +36,7 @@ from lace.mcp.tools import (
     remember,
     list_memories,
     forget_memory,
+    get_related_concepts,
 )
 from lace.mcp.resources import (
     get_patterns_resource,
@@ -185,6 +184,34 @@ def create_server() -> Server:
                     "required": ["memory_id"],
                 },
             ),
+            types.Tool(
+                name="get_related_concepts",
+                description=(
+                    "Find concepts and memories related to a given concept "
+                    "by traversing the knowledge graph. Use when you need "
+                    "broader context around a topic beyond semantic similarity."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "concept": {
+                            "type": "string",
+                            "description": "Concept to find related nodes for.",
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "description": "Hop depth (1=direct neighbors, 2=extended).",
+                            "default": 2,
+                        },
+                        "memories_only": {
+                            "type": "boolean",
+                            "description": "Return only memory nodes.",
+                            "default": False,
+                        },
+                    },
+                    "required": ["concept"],
+                },
+            ),
         ]
 
     # ── Tool call handler ─────────────────────────────────────────────────────
@@ -223,6 +250,12 @@ def create_server() -> Server:
             elif name == "forget_memory":
                 result = await forget_memory(
                     memory_id=arguments["memory_id"],
+                )
+            elif name == "get_related_concepts":
+                result = await get_related_concepts(
+                    concept=arguments["concept"],
+                    depth=arguments.get("depth", 2),
+                    memories_only=arguments.get("memories_only", False),
                 )
             else:
                 result = {"error": f"Unknown tool: {name}"}

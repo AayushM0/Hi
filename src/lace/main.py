@@ -630,6 +630,90 @@ def memory_extract(
             f"Skipped (duplicate): {result.skipped}"
         )
 
+
+@memory_app.command("rate")
+def memory_rate(
+    memory_id: Annotated[str, typer.Argument(help="Memory ID to rate.")],
+    signal: Annotated[
+        str,
+        typer.Argument(help="Rating: helpful, outdated, or wrong."),
+    ],
+) -> None:
+    """Rate a memory to improve future retrieval."""
+    if signal not in ("helpful", "outdated", "wrong"):
+        console.print("[red]✗ Invalid signal.[/red] Use: helpful, outdated, wrong")
+        raise typer.Exit(1)
+
+    store = _get_store()
+    memory = store.get(memory_id)
+    if not memory:
+        console.print(f"[red]✗ Memory not found:[/red] {memory_id}")
+        raise typer.Exit(1)
+
+    old_conf = memory.confidence
+    success = store.rate(memory_id, signal)
+
+    if success:
+        memory = store.get(memory_id)  # reload updated version
+        direction = "↑" if signal == "helpful" else "↓"
+        console.print(
+            Panel(
+                f"[bold]Memory:[/bold] {memory.display_summary()[:60]}\n"
+                f"[bold]Signal:[/bold] {signal} {direction}\n"
+                f"[bold]Confidence:[/bold] {old_conf:.2f} → [bold]{memory.confidence:.2f}[/bold]",
+                title="[bold green]✓ Memory Rated[/bold green]",
+                border_style="green",
+            )
+        )
+    else:
+        console.print("[red]✗ Failed to rate memory.[/red]")
+        raise typer.Exit(1)
+
+
+@memory_app.command("review")
+def memory_review(
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-n", help="Max memories to review."),
+    ] = 20,
+) -> None:
+    """Interactively review low-confidence or stale memories."""
+    store = _get_store()
+    candidates = store.get_review_candidates(limit=limit)
+
+    if not candidates:
+        console.print("[green]✓[/green] All memories look healthy. Nothing to review.")
+        return
+
+    console.print(
+        f"[bold]Reviewing {len(candidates)} memories[/bold] (low confidence or unaccessed)"
+    )
+
+    reviewed = 0
+    for memory in candidates:
+        console.print("\n" + "─" * 60)
+        console.print(
+            f"[bold]ID:[/bold] {memory.id}  |  [bold]Conf:[/bold] {memory.confidence:.2f}  |  "
+            f"[bold]Accesses:[/bold] {memory.access_count}"
+        )
+        console.print(f"[dim]{memory.content[:120]}{'...' if len(memory.content) > 120 else ''}[/dim]")
+
+        action = typer.prompt(
+            "Action (helpful/outdated/wrong/skip)",
+            default="skip",
+            type=str,
+        ).strip().lower()
+
+        if action in ("helpful", "outdated", "wrong"):
+            store.rate(memory.id, action)
+            reviewed += 1
+        elif action == "skip":
+            continue
+        else:
+            console.print("[yellow]Unknown action, skipping.[/yellow]")
+
+    console.print(f"\n[green]✓[/green] Reviewed {reviewed}/{len(candidates)} memories.")
+
 # Session commands
 
 session_app = typer.Typer(help="Session management.")
@@ -825,6 +909,412 @@ def logs_clear(
     r = clean_old_logs(lace_home / "logs" / "retrieval",    retention_days=older_than)
     i = clean_old_logs(lace_home / "logs" / "interactions", retention_days=older_than)
     console.print(f"[green]✓[/green] Deleted {r + i} log files.")
+
+
+# ── vault commands ────────────────────────────────────────────────────────────
+
+vault_app = typer.Typer(help="Obsidian vault sync operations.")
+app.add_typer(vault_app, name="vault")
+
+
+def _get_obs_vault(obs_vault_arg: str | None, lace_home: "Path") -> "Path | None":
+    """Resolve Obsidian vault path from arg or config."""
+    from lace.core.config import load_config
+    if obs_vault_arg:
+        p = Path(obs_vault_arg).expanduser().resolve()
+        if not p.exists():
+            console.print(f"[red]✗ Path does not exist:[/red] {p}")
+            return None
+        return p
+    # Try reading from saved state
+    from lace.vault.state import SyncState
+    state = SyncState.load(lace_home)
+    if state.obsidian_vault:
+        p = Path(state.obsidian_vault)
+        if p.exists():
+            return p
+        console.print(f"[red]✗ Saved Obsidian vault no longer exists:[/red] {p}")
+        return None
+    console.print(
+        "[red]✗ No Obsidian vault configured.[/red]\n"
+        "[dim]Pass --vault /path/to/obsidian  or run lace vault sync --vault ... once to save it.[/dim]"
+    )
+    return None
+
+
+@vault_app.command("sync")
+def vault_sync(
+    obs_vault: Annotated[
+        Optional[str],
+        typer.Option("--vault", "-v", help="Path to your Obsidian vault root."),
+    ] = None,
+    no_reindex: Annotated[
+        bool,
+        typer.Option("--no-reindex", help="Skip re-embedding pulled files."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show what would change without doing it."),
+    ] = False,
+) -> None:
+    """Full bidirectional sync between LACE vault and Obsidian."""
+    from lace.core.config import load_config
+    from lace.vault.sync import full_sync, get_sync_status
+
+    lace_home = get_lace_home()
+    config = load_config(lace_home)
+    lace_vault = config.vault_path(lace_home)
+
+    obs_path = _get_obs_vault(obs_vault, lace_home)
+    if obs_path is None:
+        raise typer.Exit(1)
+
+    if dry_run:
+        console.print(Panel(
+            f"[bold]LACE vault:[/bold]    {lace_vault}\n"
+            f"[bold]Obsidian vault:[/bold] {obs_path}\n"
+            f"[bold]Reindex:[/bold]        {not no_reindex}\n\n"
+            "[dim]Dry run — no files will be changed.[/dim]",
+            title="[bold cyan]Sync Preview[/bold cyan]",
+            border_style="cyan",
+        ))
+        # Count what would change
+        lace_files = list(lace_vault.rglob("*.md"))
+        console.print(f"[dim]LACE vault has {len(lace_files)} memory files.[/dim]")
+        return
+
+    with console.status("[bold green]Syncing vaults...[/bold green]"):
+        result = full_sync(
+            lace_vault=lace_vault,
+            obs_vault=obs_path,
+            lace_home=lace_home,
+            reindex=not no_reindex,
+        )
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    lines = []
+
+    if result.lace_to_obs:
+        lines.append(f"[green]→ Pushed to Obsidian:[/green]  {len(result.lace_to_obs)} files")
+        for f in result.lace_to_obs[:5]:
+            lines.append(f"    {f}")
+        if len(result.lace_to_obs) > 5:
+            lines.append(f"    [dim]... and {len(result.lace_to_obs) - 5} more[/dim]")
+
+    if result.obs_to_lace:
+        lines.append(f"[blue]← Pulled from Obsidian:[/blue] {len(result.obs_to_lace)} files")
+        for f in result.obs_to_lace[:5]:
+            lines.append(f"    {f}")
+        if len(result.obs_to_lace) > 5:
+            lines.append(f"    [dim]... and {len(result.obs_to_lace) - 5} more[/dim]")
+
+    if result.reindexed:
+        lines.append(f"[cyan]⟳ Re-indexed:[/cyan]          {len(result.reindexed)} memories")
+
+    if result.errors:
+        lines.append(f"[red]✗ Errors:[/red]              {len(result.errors)}")
+        for e in result.errors:
+            lines.append(f"    [red]{e}[/red]")
+
+    if not result.lace_to_obs and not result.obs_to_lace and not result.errors:
+        lines.append("[dim]Already in sync — no changes needed.[/dim]")
+
+    lines.append("")
+    lines.append(f"[dim]Skipped {len(result.skipped)} unchanged files[/dim]")
+    lines.append(f"[dim]Obsidian vault: {obs_path}[/dim]")
+
+    border = "red" if result.errors else "green"
+    title = "[bold red]Sync Complete (with errors)[/bold red]" if result.errors else "[bold green]Sync Complete[/bold green]"
+
+    console.print(Panel("\n".join(lines), title=title, border_style=border))
+
+
+@vault_app.command("watch")
+def vault_watch(
+    obs_vault: Annotated[
+        Optional[str],
+        typer.Option("--vault", "-v", help="Path to your Obsidian vault root."),
+    ] = None,
+    interval: Annotated[
+        float,
+        typer.Option("--interval", "-i", help="Poll interval in seconds."),
+    ] = 1.0,
+) -> None:
+    """Watch both vaults for changes and sync automatically. Press Ctrl+C to stop."""
+    from lace.core.config import load_config
+    from lace.vault.sync import sync_single_file
+    from lace.vault.watcher import start_watcher
+
+    lace_home = get_lace_home()
+    config = load_config(lace_home)
+    lace_vault = config.vault_path(lace_home)
+
+    obs_path = _get_obs_vault(obs_vault, lace_home)
+    if obs_path is None:
+        raise typer.Exit(1)
+
+    console.print(Panel(
+        f"[bold]LACE vault:[/bold]    {lace_vault}\n"
+        f"[bold]Obsidian vault:[/bold] {obs_path}\n"
+        f"[bold]Poll interval:[/bold]  {interval}s\n\n"
+        "[dim]Watching for changes... Press Ctrl+C to stop.[/dim]",
+        title="[bold cyan]Vault Watcher Active[/bold cyan]",
+        border_style="cyan",
+    ))
+
+    change_count = 0
+
+    def on_change(changed_file: "Path", direction: str) -> None:
+        nonlocal change_count
+        change_count += 1
+        arrow = "→ Obs" if direction == "lace_to_obs" else "← LACE"
+        console.print(f"[dim]{arrow}[/dim] [green]{changed_file.name}[/green]", end=" ")
+        try:
+            result = sync_single_file(
+                changed_file=changed_file,
+                lace_vault=lace_vault,
+                obs_vault=obs_path,
+                lace_home=lace_home,
+            )
+            if result.errors:
+                console.print(f"[red]✗ {result.errors[0]}[/red]")
+            elif result.reindexed:
+                console.print(f"[cyan]✓ synced + reindexed[/cyan]")
+            else:
+                console.print(f"[green]✓ synced[/green]")
+        except Exception as e:
+            console.print(f"[red]✗ {e}[/red]")
+
+    try:
+        start_watcher(
+            lace_vault=lace_vault,
+            obs_vault=obs_path,
+            lace_home=lace_home,
+            on_change=on_change,
+            poll_interval=interval,
+        )
+    except KeyboardInterrupt:
+        pass
+
+    console.print(f"\n[dim]Watcher stopped. {change_count} change(s) synced.[/dim]")
+
+
+@vault_app.command("status")
+def vault_status() -> None:
+    """Show current vault sync status."""
+    from lace.core.config import load_config
+    from lace.vault.sync import get_sync_status
+
+    lace_home = get_lace_home()
+    config = load_config(lace_home)
+    lace_vault = config.vault_path(lace_home)
+
+    status = get_sync_status(lace_home)
+    lace_files = list(lace_vault.rglob("*.md"))
+
+    # Count by scope
+    global_files  = [f for f in lace_files if "global"   in f.parts]
+    project_files = [f for f in lace_files if "projects" in f.parts]
+
+    obs_line = (
+        f"[green]{status['obsidian_vault']}[/green]"
+        if status["configured"]
+        else "[yellow]Not configured[/yellow]"
+    )
+
+    last_sync = (
+        status["last_full_sync"].replace("T", " ").replace("Z", " UTC")
+        if status["last_full_sync"]
+        else "[yellow]Never[/yellow]"
+    )
+
+    lines = [
+        f"[bold]LACE vault:[/bold]      {lace_vault}",
+        f"[bold]Obsidian vault:[/bold]  {obs_line}",
+        f"[bold]Last full sync:[/bold]  {last_sync}",
+        "",
+        "[bold]LACE vault contents:[/bold]",
+        f"  Total .md files:   {len(lace_files)}",
+        f"  Global memories:   {len(global_files)}",
+        f"  Project memories:  {len(project_files)}",
+        "",
+        "[bold]Sync state:[/bold]",
+        f"  LACE files tracked:    {status['lace_files_tracked']}",
+        f"  Obsidian files tracked: {status['obs_files_tracked']}",
+    ]
+
+    if not status["configured"]:
+        lines += [
+            "",
+            "[dim]Run: lace vault sync --vault /path/to/obsidian[/dim]",
+        ]
+
+    console.print(Panel(
+        "\n".join(lines),
+        title="[bold cyan]Vault Sync Status[/bold cyan]",
+        border_style="cyan",
+    ))
+
+
+# ── graph commands ────────────────────────────────────────────────────────────
+
+graph_app = typer.Typer(help="Knowledge graph operations.")
+app.add_typer(graph_app, name="graph")
+
+
+@graph_app.command("build")
+def graph_build() -> None:
+    """Build the knowledge graph from the vault."""
+    from lace.core.engine import GraphManager
+    from lace.graph.graph import get_graph_stats
+
+    lace_home = get_lace_home()
+    manager = GraphManager(lace_home=lace_home)
+
+    with console.status("[bold green]Building knowledge graph...[/bold green]"):
+        G = manager.rebuild()
+
+    stats = get_graph_stats(G)
+    console.print(Panel(
+        f"[bold]Nodes:[/bold]   {stats['total_nodes']}\n"
+        f"  Memory nodes:  {stats['memory_nodes']}\n"
+        f"  Concept nodes: {stats['concept_nodes']}\n\n"
+        f"[bold]Edges:[/bold]   {stats['total_edges']}\n"
+        + "\n".join(
+            f"  {rel}: {count}"
+            for rel, count in stats["edge_types"].items()
+        ),
+        title="[bold cyan]Knowledge Graph Built[/bold cyan]",
+        border_style="cyan",
+    ))
+
+
+@graph_app.command("stats")
+def graph_stats() -> None:
+    """Show knowledge graph statistics."""
+    from lace.core.engine import GraphManager
+    from lace.graph.graph import get_graph_stats
+
+    lace_home = get_lace_home()
+    manager = GraphManager(lace_home=lace_home)
+    G = manager.get_graph()
+    stats = get_graph_stats(G)
+
+    if stats["is_empty"]:
+        console.print("[yellow]Graph is empty. Run:[/yellow] lace graph build")
+        return
+
+    console.print(Panel(
+        f"[bold]Total nodes:[/bold]   {stats['total_nodes']}\n"
+        f"  Memory nodes:  {stats['memory_nodes']}\n"
+        f"  Concept nodes: {stats['concept_nodes']}\n\n"
+        f"[bold]Total edges:[/bold]   {stats['total_edges']}\n"
+        + "\n".join(
+            f"  {rel}: {count}"
+            for rel, count in stats["edge_types"].items()
+        ),
+        title="[bold cyan]Knowledge Graph[/bold cyan]",
+        border_style="cyan",
+    ))
+
+
+@graph_app.command("related")
+def graph_related(
+    concept: Annotated[str, typer.Argument(help="Concept or tag to find related memories for.")],
+    depth: Annotated[
+        int,
+        typer.Option("--depth", "-d", help="Hop depth for traversal."),
+    ] = 2,
+    memories_only: Annotated[
+        bool,
+        typer.Option("--memories", help="Show only memory nodes."),
+    ] = False,
+) -> None:
+    """Find concepts and memories related to a given concept."""
+    from lace.core.engine import GraphManager
+    from lace.graph.traversal import get_neighbors, find_memories_near_concept
+
+    lace_home = get_lace_home()
+    manager = GraphManager(lace_home=lace_home)
+    G = manager.get_graph()
+
+    if G.number_of_nodes() == 0:
+        console.print("[yellow]Graph is empty. Run:[/yellow] lace graph build")
+        return
+
+    if memories_only:
+        results = find_memories_near_concept(G, concept, depth=depth)
+    else:
+        # Find the concept node
+        concept_normalized = concept.lower().replace(" ", "-")
+        results = get_neighbors(G, concept_normalized, depth=depth)
+
+    if not results:
+        console.print(f"[yellow]No related nodes found for:[/yellow] {concept}")
+        console.print(
+            "[dim]Try: lace graph build  — then add [[wikilinks]] to your memories[/dim]"
+        )
+        return
+
+    table = Table(
+        title=f"Related to '{concept}' (depth={depth})",
+        show_header=True,
+        header_style="bold cyan",
+        expand=True,
+    )
+    table.add_column("Hop",      width=4)
+    table.add_column("Type",     width=8)
+    table.add_column("ID/Name",  width=20)
+    table.add_column("Relation", width=14)
+    table.add_column("Label")
+
+    for node in results:
+        node_type = node["type"]
+        color = "green" if node_type == "memory" else "cyan"
+        table.add_row(
+            str(node["distance"]),
+            f"[{color}]{node_type}[/{color}]",
+            node["id"][:20],
+            node.get("relation", "—"),
+            node.get("label", "")[:50],
+        )
+
+    console.print(table)
+
+
+@graph_app.command("show")
+def graph_show(
+    memory_id: Annotated[str, typer.Argument(help="Memory ID to show connections for.")],
+    depth: Annotated[
+        int,
+        typer.Option("--depth", "-d", help="Hop depth."),
+    ] = 1,
+) -> None:
+    """Show all graph connections for a specific memory."""
+    from lace.core.engine import GraphManager
+    from lace.graph.traversal import get_neighbors
+
+    lace_home = get_lace_home()
+    manager = GraphManager(lace_home=lace_home)
+    G = manager.get_graph()
+
+    if memory_id not in G:
+        console.print(f"[yellow]Memory {memory_id} not in graph. Run:[/yellow] lace graph build")
+        return
+
+    neighbors = get_neighbors(G, memory_id, depth=depth)
+    memory = _get_store().get(memory_id)
+
+    console.print(Panel(
+        f"[bold]{memory.display_summary() if memory else memory_id}[/bold]\n\n"
+        + "\n".join(
+            f"  {'→' if n['distance'] == 1 else '⇒'} [{n['type']}] {n['id'][:30]} "
+            f"({n.get('relation', '?')})"
+            for n in neighbors
+        ),
+        title=f"[bold cyan]Graph connections: {memory_id}[/bold cyan]",
+        border_style="cyan",
+    ))
 
 
 # ── project commands ───────────────────────────────────────────────────────────
