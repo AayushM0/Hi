@@ -153,9 +153,17 @@ async def get_project_context(
     patterns = [m for m in memories if m.category == MemoryCategory.PATTERN][:10]
     decisions = [m for m in memories if m.category == MemoryCategory.DECISION][:10]
 
+    # Load identity and preferences
+    from lace.core.identity import compose_identity
+    from lace.core.config import get_lace_home
+    lace_home = get_lace_home()
+    identity_text, preferences = compose_identity(lace_home, scope=scope)
+
     return {
         "scope": scope,
         "total_memories": len(memories),
+        "identity": identity_text or "",
+        "preferences": preferences or {},
         "patterns": [
             {"id": m.id, "summary": m.display_summary(), "tags": m.tags, "confidence": m.confidence}
             for m in patterns
@@ -197,6 +205,7 @@ async def remember(
     )
 
     return {
+        "stored": True,
         "status": "stored",
         "id": memory.id,
         "scope": memory.project_scope,
@@ -260,8 +269,11 @@ async def forget_memory(
     success = store.forget(memory_id)
 
     return {
+        "success": success,
         "status": "archived" if success else "not_found",
+        "lifecycle": "archived" if success else "not_found",
         "id": memory_id,
+        **({"error": f"Memory {memory_id} not found"} if not success else {}),
     }
 
 

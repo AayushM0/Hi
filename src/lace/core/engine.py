@@ -8,12 +8,15 @@ Persisted to disk between processes.
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 
 import networkx as nx
 
 from lace.core.config import LaceConfig, get_lace_home, load_config
 from lace.graph.graph import build_graph, load_graph, save_graph
 from lace.memory.markdown import load_all_memories
+
+logger = logging.getLogger(__name__)
 
 
 class GraphManager:
@@ -24,8 +27,8 @@ class GraphManager:
         lace_home: Path | None = None,
         config: LaceConfig | None = None,
     ) -> None:
-        self.lace_home  = lace_home or get_lace_home()
-        self.config     = config or load_config(self.lace_home)
+        self.lace_home = lace_home or get_lace_home()
+        self.config = config or load_config(self.lace_home)
         self.vault_path = self.config.vault_path(self.lace_home)
         self.graph_path = self.lace_home / "memory" / "graph" / "graph.json"
         self._graph: nx.DiGraph | None = None
@@ -59,6 +62,7 @@ class GraphManager:
         memories = load_all_memories(self.vault_path)
         G = build_graph(memories)
         save_graph(G, self.graph_path)
+
         return G
 
     def rebuild(self) -> nx.DiGraph:
@@ -68,9 +72,9 @@ class GraphManager:
 
     def add_memory_to_graph(self, memory) -> None:
         """Add a single memory to the existing graph."""
-        from lace.graph.graph import build_graph
+        from lace.graph.graph import build_graph as bg
         G = self.get_graph()
-        single_memory_graph = build_graph([memory])
+        single_memory_graph = bg([memory])
 
         # Merge nodes and edges
         G.add_nodes_from(single_memory_graph.nodes(data=True))
