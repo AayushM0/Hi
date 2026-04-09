@@ -911,6 +911,64 @@ def logs_clear(
     console.print(f"[green]✓[/green] Deleted {r + i} log files.")
 
 
+
+
+# ── wikilink commands ─────────────────────────────────────────────────────────
+
+wikilink_app = typer.Typer(help="Inject wikilinks into memory files for Obsidian visualization.")
+app.add_typer(wikilink_app, name="wikilink")
+
+
+@wikilink_app.command("inject")
+def wikilink_inject() -> None:
+    """Inject wikilinks into all memory files based on knowledge graph.
+    
+    This creates [[concept]] links in your memory markdown files, allowing
+    Obsidian to render an interactive knowledge graph visualization.
+    """
+    from lace.graph.wikilinks import inject_wikilinks_all
+    
+    console.print("[cyan]Injecting wikilinks into memory files...[/cyan]")
+    
+    result = inject_wikilinks_all()
+    
+    console.print(f"[green]✅ Updated {result['updated']}/{result['total']} memory files[/green]")
+    console.print(f"[dim]Wikilinks added based on knowledge graph relationships[/dim]")
+
+
+@wikilink_app.command("status")
+def wikilink_status() -> None:
+    """Show wikilink injection status."""
+    from lace.core.config import get_lace_home, load_config
+    
+    lace_home = get_lace_home()
+    config = load_config(lace_home)
+    vault_path = config.vault_path(lace_home)
+    
+    from lace.graph.wikilinks import extract_existing_wikilinks
+    
+    files_with_links = 0
+    total_links = 0
+    total_files = 0
+    
+    # Find all memory files
+    for md_path in vault_path.rglob("mem_*.md"):
+        total_files += 1
+        content = md_path.read_text()
+        links = extract_existing_wikilinks(content)
+        if links:
+            files_with_links += 1
+            total_links += len(links)
+    
+    console.print("[bold]Wikilink Status[/bold]")
+    console.print(f"  Total memory files: {total_files}")
+    console.print(f"  Files with wikilinks: {files_with_links}")
+    console.print(f"  Total wikilinks: {total_links}")
+    if files_with_links > 0:
+        console.print(f"  Average links per file: {total_links / files_with_links:.1f}")
+    console.print("")
+    console.print("[dim]Open your vault in Obsidian to see the interactive graph![/dim]")
+
 # ── vault commands ────────────────────────────────────────────────────────────
 
 vault_app = typer.Typer(help="Obsidian vault sync operations.")
